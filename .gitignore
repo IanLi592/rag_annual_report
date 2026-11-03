@@ -1,0 +1,27 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# 数据 & 索引（运行产物）
+data
+vectorstore/
+evaluation/results/
+
+# 本地大模型（避免误提交）
+models
+*.safetensors
+*.bin
+
+# 系统文件
+.DS_Store
+Thumbs.db
