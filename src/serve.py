@@ -54,7 +54,16 @@ async def lifespan(app: FastAPI):
     _module  = _load_pipeline_module()
     pipeline = _module.RAGPipeline(
         use_bm25          = True,
-        use_rerank        = False,
+        # 打开精排：实测（v2 题集 25 题，scripts/ci/measure_rerank.py）
+        #   RRF top4 基线      Hit@4 0.360 / MRR@4 0.210
+        #   重排 top4          Hit@4 0.440 / MRR@4 0.293   （MRR 相对 +39.5%）
+        #   重排 + 下限 0.70   Hit@4 0.440 / MRR@4 0.293，上下文字符 −11.1%
+        # 阈值 0.7 是"质量不掉而上下文变短"的实测拐点；再往上（0.85/0.95）
+        # Hit 会塌到 0.32/0.12，所以不追求更大的削减比例。
+        # 代价：每请求多约 2.2 s（10 对候选的 CrossEncoder 推理）；
+        # 模型已改为进程级单例，不再每请求重付 5.8 s 加载。
+        use_rerank        = True,
+        rerank_min_score  = 0.7,
         use_query_rewrite = False,
     )
     logger.info("Pipeline 初始化完成，开始接受请求")

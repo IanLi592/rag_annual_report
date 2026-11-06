@@ -235,27 +235,66 @@ def reciprocal_rank_fusion(
 
 # ── CrossEncoder Rerank（可选）────────────────────────────────────────────────
 
-def rerank(query: str, candidates: list[dict], top_k: int = TOP_K_RERANK) -> list[dict]:
-    """
-    用 CrossEncoder 对候选集二次精排。
-    CrossEncoder 是双向注意力模型，比 bi-encoder 更准确，但只能小批量用。
-    模型：BAAI/bge-reranker-base（中文，约 1.1 GB）
+_RERANKER = None          # 模块级单例
+_RERANKER_FAILED = False
 
-    若模型未下载或 sentence-transformers 未安装，自动降级为直接截断。
+
+def get_reranker():
+    """懒加载 CrossEncoder 单例。
+
+    为什么必须缓存：旧实现每次 rerank() 都 CrossEncoder(model_name) —— 实测
+    模型加载 5.8 s，等于每个请求白付 5.8 秒。这大概就是 serve.py 把 rerank
+    关成 False 的真实原因。
     """
+    global _RERANKER, _RERANKER_FAILED
+    if _RERANKER is not None or _RERANKER_FAILED:
+        return _RERANKER
     try:
         from sentence_transformers import CrossEncoder
-        # 如果模型已下载到项目 models/ 目录，优先用本地路径
         model_path = Path(__file__).parent.parent / "models" / "bge-reranker-base"
         model_name = str(model_path) if model_path.exists() else "BAAI/bge-reranker-base"
-        reranker = CrossEncoder(model_name)
-        pairs    = [(query, c["content"]) for c in candidates]
-        scores   = reranker.predict(pairs)
+        _RERANKER = CrossEncoder(model_name)
+        logger.info(f"Reranker 已加载并缓存：{model_name}")
+    except Exception as e:
+        _RERANKER_FAILED = True
+        logger.warning(f"Reranker 加载失败，后续请求将跳过精排: {type(e).__name__}: {e}")
+        _RERANKER = None
+    return _RERANKER
+
+
+def rerank(
+    query: str,
+    candidates: list[dict],
+    top_k: int = TOP_K_RERANK,
+    min_score: float | None = None,
+) -> list[dict]:
+    """
+    用 CrossEncoder 对候选集二次精排，并可选地**过滤长尾低分文档**。
+
+    模型：BAAI/bge-reranker-base（中文，约 1.1 GB）；不可用时降级为直接截断。
+
+    min_score 是本次新增的真实过滤能力：分数低于该阈值的文档不进上下文。
+    注意语义 —— 旧实现只排序+截断，**永远返回 top_k 条**，所以"重排削减上下文
+    Token"这个说法在旧代码下不成立。阈值取值必须由分数分布决定，
+    不能为了凑某个削减比例反推（见 scripts/ci/measure_rerank.py）。
+    """
+    reranker = get_reranker()
+    if reranker is None:
+        return candidates[:top_k]
+
+    try:
+        pairs  = [(query, c["content"]) for c in candidates]
+        scores = reranker.predict(pairs)
         for item, score in zip(candidates, scores):
             item["rerank_score"] = float(score)
-        candidates.sort(key=lambda x: -x.get("rerank_score", 0))
-    except ImportError:
-        logger.warning("sentence-transformers 未安装，跳过 Rerank（pip install sentence-transformers）")
+        ranked = sorted(candidates, key=lambda x: -x.get("rerank_score", 0))
+        if min_score is not None:
+            kept = [c for c in ranked if c["rerank_score"] >= min_score]
+            dropped = len(ranked) - len(kept)
+            if dropped:
+                logger.info(f"  Rerank 过滤掉 {dropped} 条低于 {min_score} 的长尾文档")
+            return kept[:top_k]
+        return ranked[:top_k]
     except Exception as e:
         logger.warning(f"Rerank 失败，使用 RRF 原始排序: {e}")
 
@@ -345,12 +384,16 @@ class RAGPipeline:
         use_bm25:        bool = True,
         use_rerank:      bool = True,
         use_query_rewrite: bool = False,
+        rerank_min_score: float | None = None,
     ):
         self.client        = get_client()
         self.vec_store     = VectorStore(self.client)
         self.use_bm25      = use_bm25
         self.use_rerank    = use_rerank
         self.use_qr        = use_query_rewrite
+        # 长尾过滤阈值。默认 None = 与旧行为完全一致（只排序+截断）。
+        # 阈值来自 scripts/ci/measure_rerank.py 的实测分布，不是反推某个削减比例。
+        self.rerank_min_score = rerank_min_score
         self.bm25_store    = BM25Store() if use_bm25 else None
 
     def query(
@@ -378,7 +421,7 @@ class RAGPipeline:
 
         # ④ Rerank
         if self.use_rerank:
-            final = rerank(question, candidates, TOP_K_RERANK)
+            final = rerank(question, candidates, TOP_K_RERANK, self.rerank_min_score)
         else:
             final = candidates[:TOP_K_RERANK]
 

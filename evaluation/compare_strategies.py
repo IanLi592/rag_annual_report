@@ -49,6 +49,9 @@ DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 EMBED_MODEL   = "text-embedding-v3"
 EMBED_DIM     = 1024
 
+# build_index.py 默认用哪种策略构建主索引 —— 只有这一种允许回退，见 load_index()
+STRATEGY_WHEN_FLAT = "semantic"
+
 # 消融实验用的 10 道题（取 questions.json 中有明确 target_docs 的题）
 ABLATION_QUESTION_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 11, 15]
 
@@ -70,22 +73,33 @@ def load_index(strategy: str):
     索引路径约定：
       vectorstore/faiss_{strategy}/index.bin
       vectorstore/faiss_{strategy}/meta.json
+
+    只有 semantic 允许回退到主索引文件 —— 因为 build_index.py 默认就是用它构建的，
+    两者是同一份东西。**其它策略一律不许回退**：
+    旧版本对任何缺失策略都回退到 semantic 索引，于是结果表里会出现一行标着
+    "fixed / hierarchical" 但实际跑的是 semantic 数据的假消融结论 ——
+    静默错比报错糟得多（这是我做 P0-4 时实测抓到的）。
     """
     import faiss
     vs_dir     = BASE_DIR / "vectorstore" / f"faiss_{strategy}"
     index_path = vs_dir / "index.bin"
     meta_path  = vs_dir / "meta.json"
 
-    # 兼容默认路径（semantic 策略即主路径）
     if not index_path.exists():
+        if strategy != STRATEGY_WHEN_FLAT:
+            raise FileNotFoundError(
+                f"策略 {strategy!r} 的索引不存在: {vs_dir}\n"
+                f"  不能回退到 semantic 主索引 —— 那会让消融表里出现标着 {strategy!r}\n"
+                f"  实际却是 semantic 数据的假结论。请先把 chunk_documents.py 的\n"
+                f"  STRATEGY 改成 {strategy!r} 重跑分块与 build_index.py。")
         index_path = BASE_DIR / "vectorstore" / "faiss_index.bin"
         meta_path  = BASE_DIR / "vectorstore" / "faiss_meta.json"
-        logger.warning(f"未找到 {vs_dir}，使用默认索引路径（{strategy} 策略）")
+        logger.warning(f"未找到 {vs_dir}，semantic 策略回退到主索引路径")
 
     if not index_path.exists():
         raise FileNotFoundError(
             f"找不到索引文件 {index_path}\n"
-            "请先分别构建各策略的索引（见脚本顶部说明）"
+            "请先构建索引：python src/build_index.py"
         )
 
     index     = faiss.read_index(str(index_path))
