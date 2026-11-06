@@ -50,10 +50,15 @@ def evaluate_child(top_k: int, out_path: str, mode: str = "bm25") -> int:
     if mode == "hybrid":
         vec = rp.VectorStore(rp.get_client())
 
-    qs = json.load(open(REPO / "evaluation" / "questions.json", encoding="utf-8"))["questions"]
-    qs = [q for q in qs if q.get("target_docs")]
+    # 优先用 v2（125 题）—— v1 只有 17 道有效题，单题就能移动 5.9pp，
+    # 上一轮词表 A/B 的"方向不一致"很可能只是噪声，需要更大的 n 才能分辨
+    qpath = (REPO / "evaluation" / "questions_v2.json")
+    if not qpath.exists():
+        qpath = REPO / "evaluation" / "questions.json"
+    qs = [q for q in json.load(open(qpath, encoding="utf-8"))["questions"]
+          if q.get("target_docs")]
     if not qs:
-        print("[CI][SKIP] questions.json 里没有带 target_docs 的题")
+        print("[CI][SKIP] 没有带 target_docs 的题")
         return EXIT_PREREQ
 
     hits, mrrs, missed = [], [], []
