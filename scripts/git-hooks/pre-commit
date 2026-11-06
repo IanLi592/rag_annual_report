@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+# P0-1 提交前拦截。跑静态门（py_compile + import 冒烟），零密钥零网络。
+# 逃生阀：CI_SKIP=1 git commit ...（会打印醒目警告，不静默）
+set -u
+CI_HOME="$(cd "$(dirname "$0")/../ci" && pwd)"
+. "$CI_HOME/ci_lib.sh"
+
+if ci_skip_requested; then
+  ci_note "=============================================="
+  ci_note "CI_SKIP=1 —— 本次提交【未经】任何检查，请自行确认"
+  ci_note "=============================================="
+  exit 0
+fi
+
+exec "$CI_HOME/check_static.sh"

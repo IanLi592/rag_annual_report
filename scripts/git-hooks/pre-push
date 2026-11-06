@@ -1,0 +1,27 @@
+#!/usr/bin/env sh
+# P0-2 + P1-1 推送前拦截：索引一致性（含 BM25 真实检索）+ 纯函数单测。
+# 服务门 P1-2 不在这里跑（要密钥、要冷启动 12s+），走 run_all.sh。
+set -u
+CI_HOME="$(cd "$(dirname "$0")/../ci" && pwd)"
+. "$CI_HOME/ci_lib.sh"
+
+# git 会往 stdin 灌待推的 ref 列表，读干净免得管道报错
+while read -r _lr _ls _rr _rs; do :; done
+
+if ci_skip_requested; then
+  ci_note "=============================================="
+  ci_note "CI_SKIP=1 —— 本次推送【未经】索引门与单测门，出机后果自负"
+  ci_note "=============================================="
+  exit 0
+fi
+
+worst=$EXIT_PASS
+"$CI_HOME/check_index.sh"; rc=$?
+[ "$rc" -eq "$EXIT_ASSERT" ] && worst=$EXIT_ASSERT
+[ "$rc" -eq "$EXIT_PREREQ" ] && [ "$worst" -ne "$EXIT_ASSERT" ] && worst=$EXIT_PREREQ
+
+"$CI_HOME/check_tests.sh"; rc=$?
+[ "$rc" -eq "$EXIT_ASSERT" ] && worst=$EXIT_ASSERT
+[ "$rc" -eq "$EXIT_PREREQ" ] && [ "$worst" -ne "$EXIT_ASSERT" ] && worst=$EXIT_PREREQ
+
+exit $worst

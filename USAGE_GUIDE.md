@@ -9,7 +9,7 @@
 **文档定位**：全项目的"操作手册"——所有命令、参数、报错处理都在这里，边跑代码边查。
 
 **使用方式**：
-1. 按"一、环境准备"一次性配好依赖与 API Key（`DASHSCOPE_API_KEY`，评估还需 `DEEPSEEK_API_KEY`）；
+1. 按"一、环境准备"一次性配好依赖与 API Key（`DASHSCOPE_API_KEY`，评估还需 `MIMO_API_KEY`）；
 2. 按"二、整体流程"从步骤 1 顺序跑到步骤 5；
 4. "三、在代码中直接调用"教你把 RAG 当模块嵌入自己的程序；
 5. "四、HTTP 服务模式"启动 FastAPI 后可打开浏览器访问 `http://localhost:8000` 查看可视化页面；
@@ -56,17 +56,32 @@ export DASHSCOPE_API_KEY=sk-xxxxxxxx
 
 DashScope 控制台：https://dashscope.console.aliyun.com/
 
-跑评估（`evaluation/evaluate.py`）时，RAGAS 的 LLM 打分走 DeepSeek，还需额外配置：
+跑评估（`evaluation/evaluate.py`）时，RAGAS 的 LLM 裁判默认走**小米 MiMo Token Plan**，还需额外配置：
 
 ```bash
 # PowerShell
-$env:DEEPSEEK_API_KEY = "sk-xxxxxxxx"
+$env:MIMO_API_KEY = "tp-xxxxxxxx"
 
 # Linux / macOS
-export DEEPSEEK_API_KEY=sk-xxxxxxxx
+export MIMO_API_KEY=tp-xxxxxxxx
 ```
 
-Embedding 仍走 DashScope（`text-embedding-v3`），只有 LLM 打分用 DeepSeek。
+MiMo 开放平台：https://platform.xiaomimimo.com/ —— 在「订阅管理 / API Keys」里建密钥，
+**Key 只完整显示一次**，当场存好。Token Plan 的 OpenAI 兼容端点是
+`https://token-plan-cn.xiaomimimo.com/v1`（中国集群；新加坡集群是 `token-plan-sgp.…`，
+Key 与 Base URL 必须同平台，交叉搭配是最常见的 401 来源）。
+
+Embedding 仍走 DashScope（`text-embedding-v3`），只有 LLM 裁判用 MiMo ——
+MiMo 的公开资料里没有 embeddings 端点，而 `answer_relevancy` 等指标要算向量相似度。
+
+想复现 ARCHITECTURE.md 里的旧结论（那批数字是在 DeepSeek 裁判上跑的），切回旧尺子：
+
+```bash
+$env:RAGAS_LLM_PROVIDER = "deepseek"     # 并配 DEEPSEEK_API_KEY
+```
+
+换集群或试别的模型 ID 不用改源码：`MIMO_BASE_URL` / `MIMO_MODEL` 可覆盖
+（预设见 `evaluation/evaluate.py` 的 `JUDGE_PRESETS`）。
 
 ---
 

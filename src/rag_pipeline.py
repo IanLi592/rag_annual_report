@@ -75,6 +75,20 @@ def get_client() -> OpenAI:
 
 # ── 向量检索 ──────────────────────────────────────────────────────────────────
 
+def match_filter(item: dict, filter_meta: Optional[dict]) -> bool:
+    """
+    元数据过滤谓词。向量侧与 BM25 侧共用这一份，避免两条召回链路各持一套口径。
+
+    语义（与原向量侧逐字一致）：
+      - filter_meta 为空/None → 全通过
+      - 每个键都必须存在且字符串化后相等（缺键当 ""，因此按 stock_code 过滤会把
+        没有该字段的块排除掉）
+    """
+    if not filter_meta:
+        return True
+    return all(str(item.get(k, "")) == str(v) for k, v in filter_meta.items())
+
+
 class VectorStore:
     def __init__(self, client: OpenAI):
         import faiss
@@ -113,9 +127,8 @@ class VectorStore:
             item = dict(self.meta_list[idx])
             item["vec_score"] = float(score)
 
-            if filter_meta:
-                if not all(str(item.get(k, "")) == str(v) for k, v in filter_meta.items()):
-                    continue
+            if not match_filter(item, filter_meta):
+                continue
 
             results.append(item)
             if len(results) >= top_k:
@@ -144,14 +157,35 @@ class BM25Store:
         self.jieba  = jieba
         logger.info("BM25 索引完成")
 
-    def search(self, query: str, top_k: int = TOP_K_RETRIEVE) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        top_k: int = TOP_K_RETRIEVE,
+        filter_meta: Optional[dict] = None,
+    ) -> list[dict]:
+        """
+        BM25 关键词检索，支持与向量侧完全相同的元数据过滤。
+
+        修前的缺陷：整条 BM25 链路不接受 filter_meta，use_bm25=True 是默认路径，
+        于是 RRF 融合会把别的年份/公司的块混进上下文 —— 实测请求 year=2023
+        却召回了 600519_2022_00205（2022年报 第52页）。
+        做法：把不满足过滤条件的块分数置 0，再排序；下方既有的
+        `scores[idx] < 1e-9` 判据会自动把它们跳过，不改变其它行为。
+        """
         tokens = list(self.jieba.cut(query))
         scores = self.bm25.get_scores(tokens)
+
+        if filter_meta:
+            keep = np.array(
+                [match_filter(item, filter_meta) for item in self.meta_list], dtype=bool
+            )
+            scores = np.where(keep, scores, 0.0)
+
         top_idx = np.argsort(scores)[::-1][:top_k]
 
         results = []
         for idx in top_idx:
-            if scores[idx] < 1e-9:  # 完全不相关的跳过
+            if scores[idx] < 1e-9:  # 完全不相关（含被过滤掉）的跳过
                 continue
             item = dict(self.meta_list[idx])
             item["bm25_score"] = float(scores[idx])
@@ -329,7 +363,7 @@ class RAGPipeline:
 
         # ③ BM25 + RRF 融合
         if self.use_bm25 and self.bm25_store:
-            bm25_results = self.bm25_store.search(retrieval_query, TOP_K_RETRIEVE)
+            bm25_results = self.bm25_store.search(retrieval_query, TOP_K_RETRIEVE, filter_meta)
             candidates   = reciprocal_rank_fusion(vec_results, bm25_results)
             if verbose:
                 logger.info(f"BM25 召回: {len(bm25_results)} 条，RRF 后: {len(candidates)} 条")

@@ -1,0 +1,44 @@
+{
+  "_comment": "CI 断言基线。数值来源见 docs/cicd_requirements.md §8，均为本机实测或 README 声明后已核对。",
+  "chunks_total": 10352,
+  "embedding_dim": 1024,
+  "pdf_count": 15,
+  "companies": 5,
+  "years": ["2021", "2022", "2023"],
+  "questions_total": 20,
+  "question_types": {
+    "simple_fact": 5,
+    "precise_number": 5,
+    "cross_doc_compare": 4,
+    "time_trend": 3,
+    "should_refuse": 3
+  },
+  "_questions_note": "questions.json 里的字段名是 type；evaluate.py:81 把它映射成 results 里的 question_type。已实测分布如上加总 20。",
+  "required_meta_fields": [
+    "chunk_id",
+    "content",
+    "stock_code",
+    "year",
+    "page_num",
+    "section",
+    "block_types",
+    "is_ocr",
+    "strategy",
+    "source_file"
+  ],
+  "artifacts": {
+    "faiss_index": "vectorstore/faiss_index.bin",
+    "faiss_meta": "vectorstore/faiss_meta.json",
+    "reranker_dir": "models/bge-reranker-base"
+  },
+  "interpreter": {
+    "python_minor": "3.12",
+    "default_path": "D:/softwares/miniconda/envs/ailearning/python.exe"
+  },
+  "_budget_s": {
+    "check_static": 20,
+    "check_index": 30,
+    "check_tests": 90,
+    "measured_at": "2026-11-05"
+  }
+}

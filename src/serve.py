@@ -80,9 +80,11 @@ app.add_middleware(
 # ── 数据模型 ──────────────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    question:   str           = Field(...,  example="贵州茅台2023年营业收入是多少")
-    stock_code: Optional[str] = Field(None, example="600519")
-    year:       Optional[str] = Field(None, example="2023")
+    # example 走 json_schema_extra：Field(example=...) 是 Pydantic V2 的废弃用法，
+    # V3.0 会移除（pytest 里以 PydanticDeprecatedSince20 告警形式出现过 3 条）。
+    question:   str           = Field(...,  json_schema_extra={"example": "贵州茅台2023年营业收入是多少"})
+    stock_code: Optional[str] = Field(None, json_schema_extra={"example": "600519"})
+    year:       Optional[str] = Field(None, json_schema_extra={"example": "2023"})
 
 class Citation(BaseModel):
     index:    int
@@ -210,8 +212,10 @@ def query_debug(req: QueryRequest):
         vec_results  = pipeline.vec_store.search(req.question, TOP_K, fm)
         vec_rank_map = {item["chunk_id"]: rank for rank, item in enumerate(vec_results, 1)}
 
-        # ② BM25 检索（不受 filter_meta 限制，搜全库后融合）
-        bm25_results  = pipeline.bm25_store.search(req.question, TOP_K) if pipeline.bm25_store else []
+        # ② BM25 检索：与 /query 主链路一样受 filter_meta 约束。
+        #    原注释写的是"不受 filter_meta 限制，搜全库后融合"，那是主链路修前
+        #    的真实行为；调试接口若与主链路口径不同就失去"逐步复现"的意义。
+        bm25_results  = pipeline.bm25_store.search(req.question, TOP_K, fm) if pipeline.bm25_store else []
         bm25_rank_map = {item["chunk_id"]: rank for rank, item in enumerate(bm25_results, 1)}
 
         # ③ RRF 融合

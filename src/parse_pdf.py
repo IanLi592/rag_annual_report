@@ -22,7 +22,10 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import pdfplumber          # 擅长表格提取
-import fitz                # PyMuPDF，擅长文字+图片提取
+import pymupdf             # PyMuPDF，擅长文字+图片提取。
+                          # 不用旧别名 fitz —— 它会往 stdout 打
+                          # "warning: The `fitz` API is deprecated..."，
+                          # 破坏"从子进程 stdout 取结构化输出"的写法（CI 已踩过）
 
 # OCR 依赖可选（需要同时安装 pytesseract 包 + tesseract-ocr 二进制）
 try:
@@ -123,7 +126,7 @@ def table_to_markdown(table: list[list]) -> str:
     return "\n".join(lines)
 
 
-def detect_if_scanned(page: fitz.Page, text: str) -> bool:
+def detect_if_scanned(page: pymupdf.Page, text: str) -> bool:
     """
     启发式判断：文字极少但图片多 → 很可能是扫描页。
     年报中扫描件多见于附件（审计报告原件）。
@@ -134,12 +137,12 @@ def detect_if_scanned(page: fitz.Page, text: str) -> bool:
     return len(image_list) > 0
 
 
-def ocr_page(page: fitz.Page, dpi: int = 200) -> str:
+def ocr_page(page: pymupdf.Page, dpi: int = 200) -> str:
     """对扫描页做 OCR（中文）。需要 pytesseract + tesseract-ocr 二进制。"""
     if not OCR_AVAILABLE:
         return "[扫描页，OCR 不可用（未安装 pytesseract/tesseract），内容跳过]"
     try:
-        mat  = fitz.Matrix(dpi / 72, dpi / 72)
+        mat  = pymupdf.Matrix(dpi / 72, dpi / 72)
         clip = page.rect
         pix  = page.get_pixmap(matrix=mat, clip=clip)
         img  = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -158,7 +161,7 @@ class AnnualReportParser:
 
     策略：
       - 用 pdfplumber 提取表格（它的表格算法更准）
-      - 用 PyMuPDF (fitz) 提取带字体信息的文字（用于判断标题）
+      - 用 PyMuPDF 提取带字体信息的文字（用于判断标题）
       - 对扫描页降级为 OCR
     """
 
@@ -184,7 +187,7 @@ class AnnualReportParser:
 
         # 同时打开两个解析器
         plumber_doc = pdfplumber.open(self.pdf_path)
-        fitz_doc    = fitz.open(str(self.pdf_path))
+        fitz_doc    = pymupdf.open(str(self.pdf_path))
 
         for page_num in range(len(fitz_doc)):
             fitz_page   = fitz_doc[page_num]
@@ -224,7 +227,7 @@ class AnnualReportParser:
                 table_bboxes.append(table_obj.bbox)
 
             # ── 3. 提取文字（跳过表格区域，逐行处理）──
-            page_dict = fitz_page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+            page_dict = fitz_page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
             current_para_lines = []
 
             for block in page_dict.get("blocks", []):

@@ -56,12 +56,12 @@ PDF 解析（文字 + 表格 + OCR + 章节结构）
 
 ### 3.2 PDF 解析
 
-**组合策略**：pdfplumber（表格）+ PyMuPDF/fitz（文字+字体信息）+ pytesseract（OCR，可选）
+**组合策略**：pdfplumber（表格）+ PyMuPDF（文字+字体信息）+ pytesseract（OCR，可选）
 
 | 库 | 职责 | 选型原因 |
 |----|------|---------|
 | `pdfplumber` | 表格提取 | 基于规则的表格算法，对财务报表的行列识别更准确 |
-| `PyMuPDF(fitz)` | 文字+字体元数据 | 提供每个 span 的字体大小和加粗信息，用于识别标题层级 |
+| `PyMuPDF`（`import pymupdf`） | 文字+字体元数据 | 提供每个 span 的字体大小和加粗信息，用于识别标题层级 |
 | `pytesseract` | 扫描页 OCR | 部分年报附件（审计报告原件）为扫描件，需 OCR 降级处理 |
 
 解析输出的三种块类型：
@@ -228,7 +228,7 @@ score(d) = Σ 1 / (k + rank_i(d))    k = 60（经验值）
 | **Context Precision** | LLM 判断 | 检索内容中有用比例 |
 | **Context Recall** | LLM 判断 | 需要的内容被检索到了多少 |
 
-评估中 LLM 打分使用 DeepSeek（`evaluation/evaluate.py:41` 为 `deepseek-v4-flash`，需 `DEEPSEEK_API_KEY`），Embedding 使用 DashScope `text-embedding-v3`，两者都走 OpenAI 兼容接口，无需 OpenAI key。
+评估中 LLM 裁判默认使用**小米 MiMo Token Plan**（`mimo-v2.6-flash` @ `https://token-plan-cn.xiaomimimo.com/v1`，需 `MIMO_API_KEY`；预设见 `evaluation/evaluate.py` 的 `JUDGE_PRESETS`），Embedding 使用 DashScope `text-embedding-v3`，两者都走 OpenAI 兼容接口，无需 OpenAI key。设 `RAGAS_LLM_PROVIDER=deepseek` 可切回原先的 `deepseek-v4-flash` 裁判 —— 本文下列指标数字最初是在 DeepSeek 裁判上得到的，换裁判等于换尺子，归因时要先确认档位。
 
 ### 4.3 消融实验矩阵
 

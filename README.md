@@ -22,9 +22,10 @@
 # 1. 依赖
 pip install -r requirements.txt
 
-# 2. API Key（PowerShell）
+# 2. API Key（PowerShell；或写进项目根 .env，本地 CI 会自动载入）
 $env:DASHSCOPE_API_KEY = "sk-xxxxxxxx"     # 必需：Embedding + LLM 生成
-$env:DEEPSEEK_API_KEY  = "sk-xxxxxxxx"     # 仅评估时需要：RAGAS 的 LLM 打分
+$env:MIMO_API_KEY      = "tp-xxxxxxxx"     # 仅评估时需要：RAGAS 的 LLM 裁判（小米 MiMo Token Plan）
+                                           # 想复现旧结论：$env:RAGAS_LLM_PROVIDER = "deepseek" 并配 DEEPSEEK_API_KEY
 
 # 3. 依次跑五步（本机已产出 data/ 与 vectorstore/，本地可直接从第 5 步开始）
 python src/download_reports.py      # 巨潮 API 下载 PDF
@@ -52,7 +53,7 @@ cd src && uvicorn serve:app --host 0.0.0.0 --port 8000
 | 精排 | CrossEncoder `BAAI/bge-reranker-base`（本地 1.1 GB，缺模型自动降级为截断） |
 | 生成 | DashScope `qwen-plus`，temperature 0.1 |
 | 服务 | FastAPI + uvicorn |
-| 评估 | RAGAS 四项指标（LLM 打分走 DeepSeek）+ 消融实验 Hit Rate@4 / MRR |
+| 评估 | RAGAS 四项指标（LLM 裁判走小米 MiMo Token Plan，可切回 DeepSeek）+ 消融实验 Hit Rate@4 / MRR |
 
 ## 项目结构
 

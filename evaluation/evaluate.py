@@ -36,9 +36,53 @@ EVAL_DIR   = Path(__file__).parent
 RESULT_DIR = EVAL_DIR / "results"
 RESULT_DIR.mkdir(exist_ok=True)
 
-DEEPSEEK_URL = "https://api.deepseek.com"
+# ── RAGAS 裁判 LLM 的可切换配置 ───────────────────────────────────────────────
+# 默认走小米 MiMo Token Plan（OpenAI 兼容端点）。Embedding 不受这里影响，
+# 恒走 DashScope text-embedding-v3 —— MiMo 公开资料里没有 embeddings 端点，
+# 而 answer_relevancy / context_* 有相当一部分要靠 embeddings 算相似度。
+#
+# 切换：set RAGAS_LLM_PROVIDER=deepseek（大小写不敏感）
+# 保留 DeepSeek 的意义：ARCHITECTURE.md 里那批旧结论是在 DeepSeek 裁判上跑的，
+# 换裁判等于换尺子，得留一条能一键回到旧口径的路径来归因差异。
+JUDGE_PRESETS = {
+    "mimo": {
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+        "model":    "mimo-v2.6-flash",
+        "key_env":  "MIMO_API_KEY",
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "model":    "deepseek-v4-flash",
+        "key_env":  "DEEPSEEK_API_KEY",
+    },
+}
+
+
+def resolve_judge() -> dict:
+    """取裁判配置。环境变量可逐项覆盖，便于换集群/试模型 ID 而不改代码。"""
+    name = (os.getenv("RAGAS_LLM_PROVIDER") or "mimo").strip().lower()
+    if name not in JUDGE_PRESETS:
+        raise ValueError(
+            f"未知的 RAGAS_LLM_PROVIDER={name!r}，可选：{', '.join(sorted(JUDGE_PRESETS))}"
+        )
+    preset = JUDGE_PRESETS[name]
+    cfg = {
+        "name":     name,
+        "key_env":  preset["key_env"],
+        "base_url": os.getenv(f"{name.upper()}_BASE_URL") or preset["base_url"],
+        "model":    os.getenv(f"{name.upper()}_MODEL")    or preset["model"],
+    }
+    key = os.getenv(cfg["key_env"], "")
+    if not key or key in ("sk-xxxxxxxx", "tp-xxxxxxxx"):
+        raise EnvironmentError(
+            f"裁判 LLM 走 {name}，但环境变量 {cfg['key_env']} 没填（或还是占位值）。\n"
+            f"  .env 里加一行 {cfg['key_env']}=你的key（该文件已被 .gitignore 忽略）\n"
+            f"  或临时切回旧尺子：set RAGAS_LLM_PROVIDER=deepseek"
+        )
+    return cfg
+
+
 DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-LLM_MODEL     = "deepseek-v4-flash"
 EMBED_MODEL   = "text-embedding-v3"
 
 
@@ -117,11 +161,14 @@ def run_ragas_eval(results: list[dict], pipeline_name: str) -> dict:
 
     logger.info(f"开始 RAGAS 评估（{pipeline_name}）...")
 
-    # 配置 RAGAS 使用 DashScope
+    # 裁判 LLM 可切换（默认 MiMo Token Plan）；Embedding 恒走 DashScope
+    judge = resolve_judge()
+    logger.info(f"RAGAS 裁判 LLM：{judge['name']} / {judge['model']} @ {judge['base_url']}")
+
     ragas_llm = LangchainLLMWrapper(ChatOpenAI(
-        model=LLM_MODEL,
-        openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
-        openai_api_base=DEEPSEEK_URL,
+        model=judge["model"],
+        openai_api_key=os.getenv(judge["key_env"]),
+        openai_api_base=judge["base_url"],
         temperature=0,
     ))
     ragas_embeddings = LangchainEmbeddingsWrapper(OpenAIEmbeddings(
@@ -176,6 +223,16 @@ def run_ragas_eval(results: list[dict], pipeline_name: str) -> dict:
     logger.info(f"  Answer Relevancy（答案相关性）: {answer_relevancy_v:.4f}")
     logger.info(f"  Context Precision（上下文精确率）:{context_precision_v:.4f}")
     logger.info(f"  Context Recall（上下文召回率）:  {context_recall_v:.4f}")
+
+    # ── 逐题分数落盘 ────────────────────────────────────────────────────────
+    # 只有均值就没法回答"precision 被哪几题拖低的"。按 dataset 行序 zip 回原 dict，
+    # 依赖 eval_results 与 results 共享同一批对象（它是 results 的过滤视图，不是拷贝）。
+    metric_names = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+    for r in results:
+        r.setdefault("ragas", {})          # 被排除的 should_refuse 也留个空位，便于下游判断
+    for m in metric_names:
+        for r, v in zip(eval_results, score[m]):
+            r["ragas"][m] = None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
 
     return {
         "pipeline":           pipeline_name,
@@ -233,6 +290,9 @@ def save_results(raw_results: list[dict], scores: dict, pipeline_name: str):
         "question": r["question"][:30] + "...",
         "answer_len": len(r["answer"]),
         "context_count": len(r["contexts"]),
+        # 逐题指标直接进 CSV，用 Excel 排一遍就能看出拖后腿的是哪类题
+        **{m: r.get("ragas", {}).get(m) for m in
+           ("faithfulness", "answer_relevancy", "context_precision", "context_recall")},
     } for r in raw_results])
     csv_path = RESULT_DIR / f"{pipeline_name}_{timestamp}.csv"
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -252,6 +312,17 @@ def main():
     logger.info(f"加载 {len(questions)} 道测试题")
 
     native_scores  = None
+
+    # 预检裁判配置：先验 key/供应商，别等 20 题的答案全生成完（那一步才花钱）
+    # 之后，才在打分环节报"缺 key"。实测全量一次 292 s，白花不起。
+    if not args.skip_ragas:
+        try:
+            _judge = resolve_judge()
+        except (ValueError, OSError) as e:
+            logger.error(f"裁判预检失败：{e}")
+            sys.exit(2)
+        logger.info(f"裁判预检通过：{_judge['name']} / {_judge['model']} @ {_judge['base_url']}")
+
     native_results = run_native_rag(questions)
     analyze_by_type(native_results)
     if not args.skip_ragas:
