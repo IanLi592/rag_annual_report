@@ -134,6 +134,11 @@ def retrieve_vector(query: str, index, meta_list: list, top_k: int = 10) -> list
 def retrieve_bm25(query: str, meta_list: list, top_k: int = 10) -> list[dict]:
     import jieba
     from rank_bm25 import BM25Okapi
+    # 与线上 BM25Store 同源：同一份领域词表，否则消融结论建立在另一套分词口径上
+    if str(BASE_DIR / "src") not in sys.path:
+        sys.path.insert(0, str(BASE_DIR / "src"))
+    from jieba_domain import load_domain_dict
+    load_domain_dict(jieba)
     # 懒加载 BM25（per-call，仅用于消融对比，不缓存）
     tokenized = [list(jieba.cut(m["content"])) for m in meta_list]
     bm25      = BM25Okapi(tokenized)

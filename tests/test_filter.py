@@ -78,18 +78,29 @@ def test_bm25_search_respects_year_filter(store):
 
 
 def test_bm25_search_respects_stock_and_year_together(store):
-    hits = store.search("营业收入", top_k=10, filter_meta={"stock_code": "000858", "year": "2022"})
-    assert [h["chunk_id"] for h in hits] == ["000858_2022_00005"]
+    """只测过滤语义，不测 BM25 排序结果。
+
+    为什么：词表是进程级全局的（jieba 前缀词典），本文件可能在 test_domain_dict 之后跑，
+    那时"营业收入"已经是一个 token 而不是"营业/收入"，命中集合会变。
+    排序依赖分词状态，过滤不依赖 —— 守卫必须只断言它要测的那件事。
+    """
+    hits = store.search("五粮液 销售 收入 成本", top_k=10,
+                        filter_meta={"stock_code": "000858", "year": "2022"})
+    assert hits, "过滤后一条都不剩，说明过滤条件本身失效"
+    assert all(h["stock_code"] == "000858" and h["year"] == "2022" for h in hits), \
+        [h["chunk_id"] for h in hits]
+    assert "000858_2022_00005" in {h["chunk_id"] for h in hits}
 
 
 def test_bm25_filter_removes_the_would_be_top_hit(store):
     """关键一条：过滤不是"排完序再丢几条"，而是让不合规的块根本进不了候选。
-    2022 那条语料更长、词频更高，无过滤时排第一；加了 year=2023 后它必须消失。"""
-    unfiltered = store.search("贵州茅台营业收入 亿元 增长 显著", top_k=3)
-    filtered = store.search("贵州茅台营业收入 亿元 增长 显著", top_k=3, filter_meta={"year": "2023"})
-    assert unfiltered[0]["chunk_id"] == "600519_2022_00002"
-    assert all(h["chunk_id"] != "600519_2022_00002" for h in filtered)
+    断言写成"存在被过滤掉的块"，不钉具体名次（同上，避免依赖分词状态）。"""
+    unfiltered = store.search("贵州茅台营业收入 亿元 增长 显著", top_k=5)
+    filtered = store.search("贵州茅台营业收入 亿元 增长 显著", top_k=5, filter_meta={"year": "2023"})
+    assert unfiltered, "无过滤应该要有命中"
     assert {h["year"] for h in filtered} == {"2023"}
+    dropped = {h["chunk_id"] for h in unfiltered} - {h["chunk_id"] for h in filtered}
+    assert dropped, "过滤后候选集没变小 —— 过滤根本没起作用（或语料太单一，测试前提失效）"
 
 
 def test_bm25_filter_matching_nothing_returns_empty(store):

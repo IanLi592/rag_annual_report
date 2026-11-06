@@ -147,11 +147,17 @@ class BM25Store:
     def __init__(self):
         from rank_bm25 import BM25Okapi
         import jieba
+        from jieba_domain import load_domain_dict
+
+        # 必须在任何分词之前注入，否则前缀词典已建好、后加的词不生效
+        dict_stat = load_domain_dict(jieba)
 
         with open(META_PATH, encoding="utf-8") as f:
             self.meta_list = json.load(f)
 
-        logger.info("构建 BM25 索引（分词中，请稍候）...")
+        logger.info(
+            f"构建 BM25 索引（分词中，请稍候）... "
+            f"领域词表={'已加载 ' + str(dict_stat['loaded']) + ' 词' if dict_stat['loaded'] else ('被 JIEBA_DOMAIN_DICT=0 关闭' if not dict_stat['enabled'] else '未启用')}")
         tokenized   = [list(jieba.cut(item["content"])) for item in self.meta_list]
         self.bm25   = BM25Okapi(tokenized)
         self.jieba  = jieba
