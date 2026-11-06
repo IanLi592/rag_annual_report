@@ -88,11 +88,32 @@ EMBED_MODEL   = "text-embedding-v3"
 
 # ── 加载评测题集 ──────────────────────────────────────────────────────────────
 
-def load_questions(question_ids: list[int] = None) -> list[dict]:
-    qpath = EVAL_DIR / "questions.json"
+QUESTION_SETS = {
+    # v1：20 题，ARCHITECTURE.md 里那批数字的口径
+    # v2：125 题，四类（numeric/multihop/hallucination/refusal），由 build_question_set.py
+    #      派生并经 verify_question_set.py 逐字校验；换裁判/换题集都会改变尺子
+    "v1": "questions.json",
+    "v2": "questions_v2.json",
+}
+
+
+def resolve_question_set(which: str | None) -> tuple[str, Path]:
+    name = (which or os.getenv("RAGAS_QUESTION_SET") or "v2").strip().lower()
+    if name not in QUESTION_SETS:
+        raise ValueError(f"未知题集 {name!r}，可选：{', '.join(QUESTION_SETS)}")
+    return name, EVAL_DIR / QUESTION_SETS[name]
+
+
+def load_questions(question_ids: list[int] = None, which: str | None = None) -> list[dict]:
+    name, qpath = resolve_question_set(which)
+    if not qpath.exists():
+        raise FileNotFoundError(
+            f"题集 {name} 不存在: {qpath.name}\n"
+            f"  先生成：python evaluation/build_question_set.py")
     with open(qpath, encoding="utf-8") as f:
         data = json.load(f)
     questions = data["questions"]
+    logger.info(f"题集 {name}（{qpath.name}）共 {len(questions)} 题")
     if question_ids:
         questions = [q for q in questions if q["id"] in question_ids]
     return questions
@@ -305,10 +326,17 @@ def main():
     parser = argparse.ArgumentParser(description="RAG 系统 RAGAS 评估")
     parser.add_argument("--question-ids", type=str, default=None, help="指定题号，逗号分隔，如 1,2,3")
     parser.add_argument("--skip-ragas",   action="store_true", help="跳过 RAGAS 打分，只打印答案")
+    parser.add_argument("--question-set", default=None, choices=sorted(QUESTION_SETS),
+                        help="题集：v2=125 题四类（默认，可用 RAGAS_QUESTION_SET 覆盖）；"
+                             "v1=20 题（ARCHITECTURE.md 旧结论口径）")
     args = parser.parse_args()
 
     q_ids = [int(x) for x in args.question_ids.split(",")] if args.question_ids else None
-    questions = load_questions(q_ids)
+    try:
+        questions = load_questions(q_ids, args.question_set)
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(str(e))
+        sys.exit(2)
     logger.info(f"加载 {len(questions)} 道测试题")
 
     native_scores  = None
