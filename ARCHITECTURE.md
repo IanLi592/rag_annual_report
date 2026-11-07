@@ -102,7 +102,7 @@ chunk_size=500字符，overlap=50字符
 - 子块用于精确向量匹配，父块内容在检索时附加给 LLM 作为扩展上下文
 - 即"Small-to-Big"检索策略，缓解长文档召回粒度不匹配问题
 
-**实际产出**（语义分块）：10,352 个 chunks，平均 526 字符
+**实际产出**（语义分块）：7,942 个 chunks，平均 526 字符（2026-11-07 解析去重后；去重前 10,352）
 
 ---
 
@@ -138,7 +138,7 @@ resp = client.embeddings.create(
 **FAISS IndexFlatIP**（精确内积检索）
 
 ```
-检索时间：10,352 条向量 × 1024 维 → 单次查询 < 1ms
+检索时间：7,942 条向量 × 1024 维 → 单次查询 < 1ms
 ```
 
 选型原因：
@@ -149,8 +149,8 @@ resp = client.embeddings.create(
 扩展路径：数据量 > 50 万时可换 `IndexIVFFlat`（需 `train`）或 `IndexHNSWFlat`（无需 train）。
 
 **文件产出**：
-- `vectorstore/faiss_index.bin`：索引，40.44 MiB（10,352 × 1024 × 4 bytes = 42,401,792，实测文件 42,401,837 字节）
-- `vectorstore/faiss_meta.json`：元数据，14.98 MiB（含每条 chunk 的文本和溯源信息）
+- `vectorstore/faiss_index.bin`：索引，31.02 MiB（7,942 × 1024 × 4 bytes = 32,530,432，实测文件 32,530,477 字节）
+- `vectorstore/faiss_meta.json`：元数据，11.52 MiB（含每条 chunk 的文本和溯源信息）
 
 ---
 

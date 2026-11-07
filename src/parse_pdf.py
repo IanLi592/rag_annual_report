@@ -227,8 +227,17 @@ class AnnualReportParser:
                 table_bboxes.append(table_obj.bbox)
 
             # ── 3. 提取文字（跳过表格区域，逐行处理）──
+            # 注意：table_bboxes 必须真的用上。旧版收集了它却从未在下面的循环里判断，
+            # 导致表格文字既进 table 块、又流进 text 块 —— 实测摘要页 77% 的文字行
+            # 落在表格 bbox 内，全量约 4,491 个块是这种重复（README 记为已知问题）。
             page_dict = fitz_page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
             current_para_lines = []
+
+            def _in_table(bbox) -> bool:
+                if not bbox or not table_bboxes:
+                    return False
+                return any(bbox[0] < b[2] and bbox[2] > b[0] and
+                           bbox[1] < b[3] and bbox[3] > b[1] for b in table_bboxes)
 
             for block in page_dict.get("blocks", []):
                 if block.get("type") != 0:   # 0=文字，1=图片
@@ -241,6 +250,9 @@ class AnnualReportParser:
 
                     if not line_text or is_noise_line(line_text):
                         continue
+
+                    if _in_table(line.get("bbox")):
+                        continue   # 表格内容只保留 table 块那一份
 
                     # 判断是否标题
                     spans    = line.get("spans", [])

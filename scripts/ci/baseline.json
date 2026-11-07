@@ -1,6 +1,6 @@
 {
-  "_comment": "CI 断言基线。数值来源见 docs/cicd_requirements.md §8，均为本机实测或 README 声明后已核对。",
-  "chunks_total": 10352,
+  "_comment": "CI 断言基线。数值来源见 docs/cicd_requirements.md §8 与 docs/resume_gap_plan.md §11，均为本机实测。2026-11-07 解析去重后重建主索引：10352 → 7942。",
+  "chunks_total": 7942,
   "embedding_dim": 1024,
   "pdf_count": 15,
   "companies": 5,

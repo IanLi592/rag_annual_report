@@ -233,9 +233,9 @@ def query_debug(req: QueryRequest):
         else:
             candidates = vec_results
 
-        # ④ 取 Top-K 组装上下文
+        # ④ 取 Top-K 组装上下文（structured 分块下按 parent_id 拼父块全文）
         final         = candidates[:TOP_K_FINAL]
-        context, cits = _module.build_context(final)
+        context, cits = _module.build_context(final, pipeline.parents)
 
         # ⑤ LLM 生成
         answer = _module.call_llm(req.question, context, pipeline.client)

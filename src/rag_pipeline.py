@@ -44,6 +44,8 @@ BASE_DIR        = Path(__file__).parent.parent
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 INDEX_PATH      = VECTORSTORE_DIR / "faiss_index.bin"
 META_PATH       = VECTORSTORE_DIR / "faiss_meta.json"
+# structured 分块的父块内容单独存放；子块只带 parent_id，避免整份复制
+PARENTS_PATH    = VECTORSTORE_DIR / "parents.json"
 
 DASHSCOPE_URL   = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 EMBED_MODEL     = "text-embedding-v3"
@@ -172,11 +174,11 @@ class BM25Store:
         """
         BM25 关键词检索，支持与向量侧完全相同的元数据过滤。
 
-        修前的缺陷：整条 BM25 链路不接受 filter_meta，use_bm25=True 是默认路径，
-        于是 RRF 融合会把别的年份/公司的块混进上下文 —— 实测请求 year=2023
-        却召回了 600519_2022_00205（2022年报 第52页）。
-        做法：把不满足过滤条件的块分数置 0，再排序；下方既有的
-        `scores[idx] < 1e-9` 判据会自动把它们跳过，不改变其它行为。
+        排序必须**确定性**：语料里存在大量内容完全相同的块（表格文字曾同时进
+        table/text 两处），BM25 会对它们给出完全相同的分数。np.argsort 默认
+        quicksort 不稳定，同分块的先后顺序随实现漂移 —— 实测同一份数据在
+        "argsort 版"与"sorted 版"聚合下 Hit@4 差出 9 个百分点（0.38 vs 0.288），
+        所有 A/B 结论都因此不可信。这里改成 (-score, 原始下标) 的稳定排序。
         """
         tokens = list(self.jieba.cut(query))
         scores = self.bm25.get_scores(tokens)
@@ -187,7 +189,8 @@ class BM25Store:
             )
             scores = np.where(keep, scores, 0.0)
 
-        top_idx = np.argsort(scores)[::-1][:top_k]
+        order = np.lexsort((np.arange(len(scores)), -scores))   # 先按 -score，同分按下标
+        top_idx = order[:top_k]
 
         results = []
         for idx in top_idx:
@@ -334,8 +337,14 @@ def rewrite_query(query: str, client: OpenAI) -> str:
 
 # ── LLM 生成 ──────────────────────────────────────────────────────────────────
 
-def build_context(retrieved: list[dict]) -> tuple[str, list[dict]]:
-    """将检索结果组装为 Prompt 上下文，返回上下文字符串和引用列表。"""
+def build_context(retrieved: list[dict], parents: dict | None = None) -> tuple[str, list[dict]]:
+    """将检索结果组装为 Prompt 上下文，返回上下文字符串和引用列表。
+
+    parents：{parent_id: 父块全文}。structured 分块下子块只带 parent_id，
+    父块内容在这里按 id 查表拼装（"子块召回、父块拼装"）。
+    查不到就退回 parent_content（旧 hierarchical 的内联存法），再退回子块自身。
+    """
+    parents = parents or {}
     parts     = []
     citations = []
 
@@ -351,8 +360,9 @@ def build_context(retrieved: list[dict]) -> tuple[str, list[dict]]:
         if page and page != -1:
             label += f" · 第{page}页"
 
-        # 层级分块时优先用父块内容（信息更完整）
-        content = item.get("parent_content") or item.get("content", "")
+        content = (parents.get(item.get("parent_id"))
+                   or item.get("parent_content")
+                   or item.get("content", ""))
         parts.append(f"{label}\n{content}")
         citations.append({"index": i, "source": label, "chunk_id": item.get("chunk_id", "")})
 
@@ -395,6 +405,12 @@ class RAGPipeline:
         # 阈值来自 scripts/ci/measure_rerank.py 的实测分布，不是反推某个削减比例。
         self.rerank_min_score = rerank_min_score
         self.bm25_store    = BM25Store() if use_bm25 else None
+        # 父块查表：文件不存在（semantic 索引）时为空 dict，行为与旧版完全一致
+        self.parents: dict = {}
+        if PARENTS_PATH.exists():
+            with open(PARENTS_PATH, encoding="utf-8") as f:
+                self.parents = {p["parent_id"]: p["content"] for p in json.load(f)}
+            logger.info(f"已载入父块 {len(self.parents)} 个（子块召回、父块拼装）")
 
     def query(
         self,
@@ -443,7 +459,7 @@ class RAGPipeline:
             }
 
         # ⑥ LLM 生成
-        context, citations = build_context(final)
+        context, citations = build_context(final, self.parents)
         answer = call_llm(question, context, self.client)
 
         return {"answer": answer, "citations": citations, "retrieved": final}

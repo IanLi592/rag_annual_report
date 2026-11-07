@@ -98,9 +98,12 @@ def embed_texts(client: OpenAI, texts: list[str], show_progress: bool = True) ->
 
 # ── FAISS 索引构建 ─────────────────────────────────────────────────────────────
 
-def build_faiss_index(chunks: list[dict], client: OpenAI):
+def build_faiss_index(chunks: list[dict], client: OpenAI, out_dir: Path = None):
     """
     构建 FAISS 向量索引。
+
+    out_dir：默认写主路径（vectorstore/）。A/B 新分块策略时传独立目录，
+    避免在验证完成前覆盖线上索引。
 
     FAISS 说明：
       IndexFlatIP = 暴力内积检索，精确但不近似。
@@ -108,6 +111,9 @@ def build_faiss_index(chunks: list[dict], client: OpenAI):
       数据量更大时可换 IndexIVFFlat（需要 train）或 IndexHNSW。
     """
     import faiss
+
+    out_dir = Path(out_dir) if out_dir else VECTORSTORE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"开始计算 {len(chunks)} 条 chunk 的 embedding...")
     texts      = [c["content"] for c in chunks]
@@ -119,8 +125,8 @@ def build_faiss_index(chunks: list[dict], client: OpenAI):
     logger.info(f"索引构建完成，共 {index.ntotal} 条向量")
 
     # 持久化：索引文件 + 元数据（分开存，避免把大向量序列化进 JSON）
-    index_path = VECTORSTORE_DIR / "faiss_index.bin"
-    meta_path  = VECTORSTORE_DIR / "faiss_meta.json"
+    index_path = out_dir / "faiss_index.bin"
+    meta_path  = out_dir / "faiss_meta.json"
 
     faiss.write_index(index, str(index_path))
     logger.info(f"FAISS 索引已保存 → {index_path}  ({index_path.stat().st_size//1024} KB)")
@@ -146,6 +152,19 @@ def build_faiss_index(chunks: list[dict], client: OpenAI):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta_list, f, ensure_ascii=False, indent=2)
     logger.info(f"元数据已保存 → {meta_path}")
+
+    # structured 分块：把父块 sidecar 拷进索引目录，检索时按 parent_id 查表拼装
+    strategy = chunks[0]["metadata"].get("strategy", "") if chunks else ""
+    if strategy == "structured":
+        src_parents = CHUNKS_DIR / "all_structured_parents.json"
+        if src_parents.exists():
+            parents = json.load(open(src_parents, encoding="utf-8"))
+            pout = out_dir / "parents.json"
+            with open(pout, "w", encoding="utf-8") as f:
+                json.dump(parents, f, ensure_ascii=False, indent=2)
+            logger.info(f"父块已保存 → {pout}（{len(parents)} 个）")
+        else:
+            logger.warning("structured 策略但找不到 all_structured_parents.json")
 
     return index, meta_list
 
@@ -196,25 +215,36 @@ def build_chroma_index(chunks: list[dict], client: OpenAI):
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 def main():
-    if not CHUNKS_FILE.exists():
-        logger.error(f"找不到 {CHUNKS_FILE}，请先运行 chunk_documents.py")
+    import argparse
+    ap = argparse.ArgumentParser(description="构建向量索引")
+    ap.add_argument("--strategy", default=STRATEGY,
+                    choices=["fixed", "semantic", "hierarchical", "structured"])
+    ap.add_argument("--out-dir", default=None,
+                    help="默认写主路径 vectorstore/；A/B 新策略时传独立目录，"
+                         "验证完成前不要覆盖线上索引")
+    a = ap.parse_args()
+
+    chunks_file = CHUNKS_DIR / f"all_{a.strategy}.json"
+    if not chunks_file.exists():
+        logger.error(f"找不到 {chunks_file}，请先运行 chunk_documents.py --strategy {a.strategy}")
         return
 
-    with open(CHUNKS_FILE, encoding="utf-8") as f:
+    with open(chunks_file, encoding="utf-8") as f:
         chunks = json.load(f)
-    logger.info(f"加载 {len(chunks)} 个 chunks（策略={STRATEGY}）")
+    logger.info(f"加载 {len(chunks)} 个 chunks（策略={a.strategy}）")
 
     client = get_client()
 
     # 默认用 FAISS
-    build_faiss_index(chunks, client)
+    build_faiss_index(chunks, client, out_dir=a.out_dir)
 
     # 若要对比 ChromaDB，取消下行注释：
     # build_chroma_index(chunks, client)
 
+    out = Path(a.out_dir) if a.out_dir else VECTORSTORE_DIR
     logger.info("\n索引构建完成！")
-    logger.info(f"  FAISS 索引: {VECTORSTORE_DIR / 'faiss_index.bin'}")
-    logger.info(f"  元数据:     {VECTORSTORE_DIR / 'faiss_meta.json'}")
+    logger.info(f"  FAISS 索引: {out / 'faiss_index.bin'}")
+    logger.info(f"  元数据:     {out / 'faiss_meta.json'}")
 
 
 if __name__ == "__main__":

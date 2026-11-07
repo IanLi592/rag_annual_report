@@ -194,3 +194,35 @@ def test_debug_endpoint_passes_filter_meta_too():
     assert calls, "debug 端点里没找到 bm25_store.search 调用"
     for c in calls:
         assert len(c.args) + len(c.keywords) >= 3, "debug 端点的 BM25 调用丢了 filter_meta"
+
+
+def test_bm25_ranking_is_deterministic_under_ties(store):
+    """语料里有内容完全相同的块时，BM25 会同分。
+    np.argsort(quicksort) 不稳定会让 top-k 截断随实现漂移 —— 实测同一份数据
+    在两种聚合写法下 Hit@4 差 9 个百分点，所有 A/B 结论都不可信。
+    这里钉住：重复查询、以及故意构造的同分语料，顺序必须完全一致。"""
+    a = store.search("贵州茅台营业收入", top_k=10)
+    b = store.search("贵州茅台营业收入", top_k=10)
+    assert [x["chunk_id"] for x in a] == [x["chunk_id"] for x in b]
+
+    from rank_bm25 import BM25Okapi
+    import jieba
+    # 2 份内容完全相同（制造真实同分）+ 4 份无关。
+    # 三个坑都要避开：
+    #   ① 查询词若出现在全部文档里，idf 退化为 0；
+    #   ② rank_bm25 的老 idf 公式 log((N-df+0.5)/(df+0.5)) 在 df == N/2 时**恰好为 0**，
+    #      所以重复份数必须小于语料一半，否则总分恒 0 被 1e-9 判据滤空；
+    #   ③ 语料里的空格会被 jieba 切成独立 token 且 df=N，idf 为负，能把总分拖成负数。
+    dup = rp.BM25Store.__new__(rp.BM25Store)
+    dup.meta_list = (
+        [{"chunk_id": f"d{i}", "content": "完全相同的内容，营业收入、净利润均增长",
+          "stock_code": "600519", "year": str(2020 + i)} for i in range(2)]
+        + [{"chunk_id": f"x{i}", "content": f"第{i}家其他公司，智能安防与视频监控出货",
+            "stock_code": "002415", "year": str(2020 + i)} for i in range(4)]
+    )
+    dup.jieba = jieba
+    dup.bm25 = BM25Okapi([list(jieba.cut(m["content"])) for m in dup.meta_list])
+    r1 = [x["chunk_id"] for x in dup.search("营业收入、净利润", top_k=2)]
+    r2 = [x["chunk_id"] for x in dup.search("营业收入、净利润", top_k=2)]
+    assert r1 == r2 == ["d0", "d1"], \
+        f"同分块顺序不稳定（应按下标 tie-break）: {r1} vs {r2}"

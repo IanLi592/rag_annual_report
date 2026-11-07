@@ -12,8 +12,8 @@
 |------|------|------|
 | 语料 | `data/raw_pdf/` | 15 份 PDF（5 家公司 × 2021–2023），84.3 MiB |
 | 解析 | `data/parsed/` | 15 个 JSON，共 43,048 个 blocks |
-| 分块 | `data/chunks/all_semantic.json` | 10,352 个 chunks，平均 526 字符，14.96 MiB |
-| 索引 | `vectorstore/faiss_index.bin` | 10,352 × 1024 维，40.44 MiB（`faiss_meta.json` 14.98 MiB） |
+| 分块 | `data/chunks/all_semantic.json` | 7,942 个 chunks，平均 526 字符，11.50 MiB（2026-11-07 解析去重后） |
+| 索引 | `vectorstore/faiss_index.bin` | 7,942 × 1024 维，31.02 MiB（`faiss_meta.json` 11.52 MiB） |
 | 评测 | `evaluation/questions.json` | 20 题：事实 5 / 数字 5 / 对比 4 / 趋势 3 / 应拒绝 3 |
 
 ## 快速开始
@@ -89,4 +89,4 @@ rag_annual_report/
 
 1. `data/`、`vectorstore/`、`models/` 都被 `.gitignore` 排除。新克隆需自己跑步骤 1–4，建索引约 5–10 分钟、约 0.35 元。
 2. Rerank 默认开启，但本地没有 1.1 GB 的 `models/bge-reranker-base/` 时会自动降级为直接截断，不影响其他环节。OCR 依赖系统级 `tesseract-ocr`，未安装则扫描页留占位符。
-3. 表格内容会在 `table` 块和 `text` 块中重复进入 chunk（约 4,491 个块含表格）。这是 `parse_pdf.py` 的已知问题，影响 chunk 数量但不影响答案质量，详见 ARCHITECTURE.md 第五节。
+3. ~~表格内容在 `table` 与 `text` 块重复~~ **已修（2026-11-07）**：`parse_pdf.py` 原先收集了 `table_bboxes` 却从未在文字提取里使用，摘要页 77% 的文字行被重复发射；现在表格区域只保留 table 块那一份，块数 43,048 → 39,893。

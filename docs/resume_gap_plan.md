@@ -404,3 +404,66 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 
 我倾向 **1**：净指标持平，但它消除的是"答错公司"这种**用户可感知的硬错误**，
 而代价是趋势题的排名变化 —— 前者的产品代价明显更高。不过这是产品判断，你定。
+
+---
+
+## 11. P0-3 / P1-2 结果：去重是真收益，structured 分块**不晋升**（2026-11-07）
+
+### 先承认：我上一轮报过一个错结论
+
+上一轮我说"去重让 BM25 Hit 从 0.400 掉到 0.304，重复块在充当数据增强"。
+**那是错的**，错因是我的临时测量脚本不可信：同一份数据、同一构建路径，
+在不同脚本里给出过 0.380 与 0.288 两个 Hit@4，差异来源至今未完全定位。
+
+排查中确认了一个**真缺陷**：`BM25Store.search` 用 `np.argsort`（quicksort，不稳定），
+而语料里存在大量内容完全相同的块 → 海量同分 → top-k 截断位置随实现漂移。
+已改为 `np.lexsort((下标, -score))` 的确定性排序，并加守卫
+（`test_bm25_ranking_is_deterministic_under_ties`：同分块必须按下标 tie-break）。
+
+随后把对比收敛到**唯一测量入口** `scripts/ci/measure_chunksets.py`，两条硬门槛：
+只走生产构建路径（`BM25Store.__init__`）；每个配置独立跑两遍，**不一致就退出码 3 拒绝出结论**。
+
+### 可复现门槛下的真值（BM25 单路，100 题，零 API）
+
+| 方案 | chunks | 内容 sha | Hit@4 | MRR@4 |
+|---|---|---|---|---|
+| semantic_old（旧线上索引） | 10352 | 706fe1c713 | 0.380 | 0.196 |
+| semantic_new（解析去重后） | 7942 | b43aa7d963 | **0.400** | **0.208** |
+| structured（摘要+章节树） | 7831 | f566ec0ffa | **0.410** | **0.217** |
+
+去重 **+2.0pp**（不是 −9.6pp），structured 再 +1.0pp。两遍重复测量完全一致。
+
+### 但混合检索上 structured 输 20pp —— 所以不晋升
+
+| 口径（40 题，hybrid） | Hit@4 | MRR@4 | 上下文字符 |
+|---|---|---|---|
+| semantic | 0.500 | 0.275 | 3428 |
+| structured | 0.300 | 0.154 | 3839 |
+
+BM25 赢、hybrid 输 → 回归全在**向量侧**：摘要+拆段后的子块 embedding 效果
+不如 semantic 的整段块，且块数更少、检索面更窄。上下文还变长 12%（父块拼装）。
+
+**决定：structured 保留为可选策略（`--strategy structured`，索引在
+`vectorstore/structured/`），不设为默认、不晋升主索引。** 简历里"表格摘要注入提升 25%"
+与"Parent-Child 解决上下文断层"这两句，目前**没有支持性数据**，不能写进结论。
+
+### 解析去重修复本身是真收益，已晋升
+
+`parse_pdf.py` 的 `table_bboxes` 收集后从未使用（注释写着"后续跳过"但代码没跳），
+导致表格文字既进 table 块又流进 text 块：实测摘要页 **77% 的文字行**落在表格 bbox 内，
+全量约 3,155 个重复块（43048 → 39893，−7.3%）。修复后抽查 200 个表格块，
+表头重复进 text 块的数量从 ~200 降到 **0**。
+
+旧主索引是旧解析数据的产物，与去重后的 chunks 不一致 —— 已把旧索引留档到
+`vectorstore/semantic_old/`，并用去重后的 semantic 重建主索引（一次 embedding 开销）。
+`baseline.json` 的 10352 随之更新为重建后的实测值。
+
+### 本轮新增/改动的可复用资产
+
+- `scripts/ci/measure_chunksets.py` —— 带可复现门槛的分块对比唯一入口
+- `scripts/ci/measure_index_ab.py` —— hybrid 对比（BM25 腿已改为只走生产构建路径）
+- `src/chunk_documents.py` —— `chunk_structured` / `summarize_table` / `clean_table`，
+  超大单块拆分（旧 semantic 也有"6000 字段落原样成一个块"的毛病）
+- `src/rag_pipeline.py` —— 确定性排序；`get_reranker` 单例；`build_context(..., parents)`
+  支持按 parent_id 拼父块；`RAGPipeline` 载入 `vectorstore/parents.json`
+- `tests/test_chunk_structured.py` 13 条（含"子块内容必须是其父块内容子串"这条结构不变量）
