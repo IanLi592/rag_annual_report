@@ -16,6 +16,7 @@ PDF 解析脚本：将原始年报 PDF 转换为结构化文本
 
 import re
 import json
+import argparse
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
@@ -37,6 +38,10 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# VLM 分支：默认关闭，只有显式 --vlm-mode / VLM_MODE 才启用。
+# 页类型判断、prompt、响应解析都在 parse_pdf_vlm，这里只负责路由与回退。
+from parse_pdf_vlm import VlmConfig, get_vlm_client, is_complex_page, parse_page_vlm
 
 RAW_DIR    = Path(__file__).parent.parent / "data" / "raw_pdf"
 PARSED_DIR = Path(__file__).parent.parent / "data" / "parsed"
@@ -61,6 +66,8 @@ class ParsedBlock:
     page_num:     int
     section_path: list[str]      # ["第三章 管理层讨论", "一、经营情况概述"]
     is_ocr:       bool = False   # 是否经过 OCR，质量可能有误
+    heading_level: int = 0       # 0=非标题；1/2/3=H1/H2/H3
+    parser:       str = "rule"   # rule | vlm | ocr
     raw_table:    Optional[list] = field(default=None, repr=False)  # 原始表格数据
 
 
@@ -77,6 +84,7 @@ NOISE_PATTERNS = [
     re.compile(r"^.{1,40}年度报告\s*$"),    # 页眉：公司名+年度报告
     re.compile(r"^\d+\s*$"),                # 独立页码
     re.compile(r"^—\s*\d+\s*—$"),          # — 38 —
+    re.compile(r"^\d+\s*/\s*\d+$"),         # 62 / 143（页脚页码，避免混进 section_path）
 ]
 
 
@@ -97,6 +105,30 @@ def is_title_line(line: str, fontsize: Optional[float] = None, is_bold: bool = F
     if is_bold and len(line.strip()) < 50:
         return True
     return any(p.match(line.strip()) for p in CHAPTER_PATTERNS)
+
+
+def classify_heading(title: str, fontsize: Optional[float] = None, is_bold: bool = False) -> int:
+    """把标题分成 H1/H2/H3（返回 1/2/3；非标题返回 0）。
+
+    优先用年报的编号规律，字体大小只作 fallback —— 很多年报的章标题字号
+    并不比正文大多少，但“第X章/第X节/一、”是稳定信号。
+    """
+    t = title.strip()
+    if re.match(r"^第[一二三四五六七八九十百]+章", t):
+        return 1
+    if re.match(r"^第[一二三四五六七八九十百]+节", t):
+        return 2
+    if re.match(r"^[一二三四五六七八九十]+、", t):
+        return 3
+    if re.match(r"^\d+\.\s", t):
+        return 3
+    if fontsize and fontsize >= 18:
+        return 1
+    if fontsize and fontsize >= 14:
+        return 2
+    if is_bold:
+        return 3
+    return 0
 
 
 def table_to_markdown(table: list[list]) -> str:
@@ -165,22 +197,202 @@ class AnnualReportParser:
       - 对扫描页降级为 OCR
     """
 
-    def __init__(self, pdf_path: Path, meta: dict = None):
+    def __init__(self, pdf_path: Path, meta: dict = None, vlm_config: VlmConfig = None):
         self.pdf_path = pdf_path
         self.meta     = meta or {}
         self.blocks: list[ParsedBlock] = []
         self._section_stack: list[str] = []
+        self._section_levels: list[int] = []
+        # VLM 默认关闭；只有显式 --vlm-mode / VLM_MODE 才启用
+        self.vlm_config = vlm_config or VlmConfig()
+        self._vlm_pages_used = 0
+        self._vlm_sample_seen = 0
+        self._vlm_budget_warned = False
 
-    def _update_section(self, title: str):
-        """维护章节栈：根据缩进/编号层级推断层次。"""
-        if re.match(r"^第[一二三四五六七八九十]+章", title):
-            self._section_stack = [title]           # 顶级章
-        elif re.match(r"^第[一二三四五六七八九十]+节", title):
-            self._section_stack = self._section_stack[:1] + [title]  # 二级节
-        elif re.match(r"^[一二三四五六七八九十]、", title):
-            self._section_stack = self._section_stack[:2] + [title]  # 三级
+    def _update_section(self, title: str, level: int = 0):
+        """维护章节栈：根据编号层级推断层次，并显式记录 H1/H2/H3。"""
+        level = level or classify_heading(title)
+        if level == 1 or not self._section_stack:
+            self._section_stack = [title]                              # H1
+            self._section_levels = [1]
+        elif level == 2:
+            self._section_stack = self._section_stack[:1] + [title]     # H2
+            self._section_levels = self._section_levels[:1] + [2]
+        elif level == 3:
+            self._section_stack = self._section_stack[:2] + [title]     # H3
+            self._section_levels = self._section_levels[:2] + [3]
         else:
+            # 没有编号规律的标题保留旧行为：最多保留三级 + 当前标题
             self._section_stack = self._section_stack[:3] + [title]
+            self._section_levels = self._section_levels[:3] + [3]
+
+    def _should_use_vlm(self, page_num: int, raw_text: str, plumb_page, fitz_page) -> bool:
+        cfg = self.vlm_config
+        if cfg.pages is not None:
+            return (page_num + 1) in cfg.pages
+        if cfg.mode == "off":
+            return False
+        candidate = True if cfg.mode == "all" else is_complex_page(
+            plumb_page, fitz_page, raw_text)
+        if not candidate:
+            return False
+        if cfg.sample:
+            if self._vlm_sample_seen >= cfg.sample:
+                return False
+            self._vlm_sample_seen += 1
+        return True
+
+    def _try_vlm(self, page_num: int, raw_text: str, plumb_page, fitz_page):
+        """尝试 VLM 解析一页；任何失败都返回 None，让调用方回退规则解析。"""
+        if not self._should_use_vlm(page_num, raw_text, plumb_page, fitz_page):
+            return None
+
+        cfg = self.vlm_config
+        if cfg.max_pages and self._vlm_pages_used >= cfg.max_pages:
+            if not self._vlm_budget_warned:
+                logger.warning(
+                    f"  VLM 已达到预算上限 {cfg.max_pages} 页，后续页回退规则解析"
+                    f"（调大 VLM_MAX_PAGES 或 --vlm-max-pages 可继续）")
+                self._vlm_budget_warned = True
+            return None
+
+        cache_path = cfg.cache_dir / self.pdf_path.stem / f"page_{page_num + 1:04d}.json"
+        if cache_path.exists():
+            try:
+                data = json.loads(cache_path.read_text(encoding="utf-8"))
+                logger.debug(f"  第{page_num+1}页命中 VLM 缓存")
+                return [ParsedBlock(**b) for b in data]
+            except Exception as e:
+                logger.warning(f"  第{page_num+1}页 VLM 缓存损坏，重新解析: {e}")
+
+        client = get_vlm_client()
+        if client is None:
+            if not self._vlm_budget_warned:
+                logger.warning("  未设置 DASHSCOPE_API_KEY，VLM 分支回退规则解析")
+                self._vlm_budget_warned = True
+            return None
+
+        try:
+            data = parse_page_vlm(
+                self.pdf_path, page_num + 1, list(self._section_stack),
+                client, dpi=cfg.dpi,
+            )
+        except Exception as e:
+            logger.warning(
+                f"  第{page_num+1}页 VLM 解析失败，回退规则解析: "
+                f"{type(e).__name__}: {e}")
+            return None
+
+        self._vlm_pages_used += 1
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"  VLM 缓存写入失败（不影响本次解析）: {e}")
+
+        logger.info(f"  第{page_num+1}页使用 Qwen-VL 解析，{len(data)} 个块")
+        return [ParsedBlock(**b) for b in data]
+
+    def _parse_page_rule(self, page_num: int, fitz_page, plumb_page, raw_text: str = None):
+        """规则解析一页（原有逻辑，抽出来供 VLM 失败时回退）。"""
+        raw_text = raw_text if raw_text is not None else fitz_page.get_text("text")
+        is_scanned = detect_if_scanned(fitz_page, raw_text)
+
+        if is_scanned:
+            logger.debug(f"  第{page_num+1}页：检测到扫描件，启动 OCR")
+            ocr_text = ocr_page(fitz_page)
+            self.blocks.append(ParsedBlock(
+                block_type="text",
+                content=ocr_text,
+                page_num=page_num + 1,
+                section_path=list(self._section_stack),
+                is_ocr=True,
+                parser="ocr",
+            ))
+            return
+
+        # ── 2. 提取表格（用 pdfplumber）──
+        table_bboxes = []
+        for table in plumb_page.extract_tables():
+            if table:
+                md = table_to_markdown(table)
+                if md:
+                    self.blocks.append(ParsedBlock(
+                        block_type="table",
+                        content=md,
+                        page_num=page_num + 1,
+                        section_path=list(self._section_stack),
+                        raw_table=table,
+                    ))
+        # 记录表格所在区域（后续跳过这些区域的文字提取）
+        for table_obj in plumb_page.find_tables():
+            table_bboxes.append(table_obj.bbox)
+
+        # ── 3. 提取文字（跳过表格区域，逐行处理）──
+        # 注意：table_bboxes 必须真的用上。旧版收集了它却从未在下面的循环里判断，
+        # 导致表格文字既进 table 块、又流进 text 块 —— 实测摘要页 77% 的文字行
+        # 落在表格 bbox 内，全量约 4,491 个块是这种重复（README 记为已知问题）。
+        page_dict = fitz_page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
+        current_para_lines = []
+
+        def _in_table(bbox) -> bool:
+            if not bbox or not table_bboxes:
+                return False
+            return any(bbox[0] < b[2] and bbox[2] > b[0] and
+                       bbox[1] < b[3] and bbox[3] > b[1] for b in table_bboxes)
+
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:   # 0=文字，1=图片
+                continue
+
+            for line in block.get("lines", []):
+                line_text = "".join(
+                    span["text"] for span in line.get("spans", [])
+                ).strip()
+
+                if not line_text or is_noise_line(line_text):
+                    continue
+
+                if _in_table(line.get("bbox")):
+                    continue   # 表格内容只保留 table 块那一份
+
+                # 判断是否标题
+                spans    = line.get("spans", [])
+                fontsize = spans[0].get("size", 0) if spans else 0
+                is_bold  = any("Bold" in span.get("font", "") for span in spans)
+
+                if is_title_line(line_text, fontsize, is_bold):
+                    # 先把积累的段落存起来
+                    if current_para_lines:
+                        self.blocks.append(ParsedBlock(
+                            block_type="text",
+                            content="\n".join(current_para_lines),
+                            page_num=page_num + 1,
+                            section_path=list(self._section_stack),
+                        ))
+                        current_para_lines = []
+
+                    level = classify_heading(line_text, fontsize, is_bold)
+                    self._update_section(line_text, level)
+                    self.blocks.append(ParsedBlock(
+                        block_type="title",
+                        content=line_text,
+                        page_num=page_num + 1,
+                        section_path=list(self._section_stack),
+                        heading_level=level,
+                    ))
+                else:
+                    current_para_lines.append(line_text)
+
+        # 最后一段
+        if current_para_lines:
+            self.blocks.append(ParsedBlock(
+                block_type="text",
+                content="\n".join(current_para_lines),
+                page_num=page_num + 1,
+                section_path=list(self._section_stack),
+            ))
 
     def parse(self) -> list[ParsedBlock]:
         logger.info(f"开始解析: {self.pdf_path.name}")
@@ -188,109 +400,30 @@ class AnnualReportParser:
         # 同时打开两个解析器
         plumber_doc = pdfplumber.open(self.pdf_path)
         fitz_doc    = pymupdf.open(str(self.pdf_path))
+        self._vlm_pages_used = 0
+        self._vlm_sample_seen = 0
 
-        for page_num in range(len(fitz_doc)):
-            fitz_page   = fitz_doc[page_num]
-            plumb_page  = plumber_doc.pages[page_num]
+        try:
+            for page_num in range(len(fitz_doc)):
+                fitz_page   = fitz_doc[page_num]
+                plumb_page  = plumber_doc.pages[page_num]
+                raw_text    = fitz_page.get_text("text")
 
-            # ── 1. 先用 PyMuPDF 获取带字体信息的文字 ──
-            raw_text = fitz_page.get_text("text")
-            is_scanned = detect_if_scanned(fitz_page, raw_text)
-
-            if is_scanned:
-                logger.debug(f"  第{page_num+1}页：检测到扫描件，启动 OCR")
-                ocr_text = ocr_page(fitz_page)
-                self.blocks.append(ParsedBlock(
-                    block_type="text",
-                    content=ocr_text,
-                    page_num=page_num + 1,
-                    section_path=list(self._section_stack),
-                    is_ocr=True,
-                ))
-                continue
-
-            # ── 2. 提取表格（用 pdfplumber）──
-            table_bboxes = []
-            for table in plumb_page.extract_tables():
-                if table:
-                    md = table_to_markdown(table)
-                    if md:
-                        self.blocks.append(ParsedBlock(
-                            block_type="table",
-                            content=md,
-                            page_num=page_num + 1,
-                            section_path=list(self._section_stack),
-                            raw_table=table,
-                        ))
-            # 记录表格所在区域（后续跳过这些区域的文字提取）
-            for table_obj in plumb_page.find_tables():
-                table_bboxes.append(table_obj.bbox)
-
-            # ── 3. 提取文字（跳过表格区域，逐行处理）──
-            # 注意：table_bboxes 必须真的用上。旧版收集了它却从未在下面的循环里判断，
-            # 导致表格文字既进 table 块、又流进 text 块 —— 实测摘要页 77% 的文字行
-            # 落在表格 bbox 内，全量约 4,491 个块是这种重复（README 记为已知问题）。
-            page_dict = fitz_page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
-            current_para_lines = []
-
-            def _in_table(bbox) -> bool:
-                if not bbox or not table_bboxes:
-                    return False
-                return any(bbox[0] < b[2] and bbox[2] > b[0] and
-                           bbox[1] < b[3] and bbox[3] > b[1] for b in table_bboxes)
-
-            for block in page_dict.get("blocks", []):
-                if block.get("type") != 0:   # 0=文字，1=图片
+                vlm_blocks = self._try_vlm(page_num, raw_text, plumb_page, fitz_page)
+                if vlm_blocks is not None:
+                    # VLM 页同样要推进章节栈：混合模式下，下一页的规则解析
+                    # 必须知道这一页新出现的标题，否则 section_path 会停在旧章节。
+                    for b in vlm_blocks:
+                        if b.block_type == "title":
+                            self._update_section(b.content, b.heading_level)
+                        b.section_path = list(self._section_stack)
+                    self.blocks.extend(vlm_blocks)
                     continue
 
-                for line in block.get("lines", []):
-                    line_text = "".join(
-                        span["text"] for span in line.get("spans", [])
-                    ).strip()
-
-                    if not line_text or is_noise_line(line_text):
-                        continue
-
-                    if _in_table(line.get("bbox")):
-                        continue   # 表格内容只保留 table 块那一份
-
-                    # 判断是否标题
-                    spans    = line.get("spans", [])
-                    fontsize = spans[0].get("size", 0) if spans else 0
-                    is_bold  = any("Bold" in span.get("font", "") for span in spans)
-
-                    if is_title_line(line_text, fontsize, is_bold):
-                        # 先把积累的段落存起来
-                        if current_para_lines:
-                            self.blocks.append(ParsedBlock(
-                                block_type="text",
-                                content="\n".join(current_para_lines),
-                                page_num=page_num + 1,
-                                section_path=list(self._section_stack),
-                            ))
-                            current_para_lines = []
-
-                        self._update_section(line_text)
-                        self.blocks.append(ParsedBlock(
-                            block_type="title",
-                            content=line_text,
-                            page_num=page_num + 1,
-                            section_path=list(self._section_stack),
-                        ))
-                    else:
-                        current_para_lines.append(line_text)
-
-            # 最后一段
-            if current_para_lines:
-                self.blocks.append(ParsedBlock(
-                    block_type="text",
-                    content="\n".join(current_para_lines),
-                    page_num=page_num + 1,
-                    section_path=list(self._section_stack),
-                ))
-
-        plumber_doc.close()
-        fitz_doc.close()
+                self._parse_page_rule(page_num, fitz_page, plumb_page, raw_text)
+        finally:
+            plumber_doc.close()
+            fitz_doc.close()
 
         logger.info(f"  解析完成: {len(self.blocks)} 个块")
         return self.blocks
@@ -313,6 +446,34 @@ class AnnualReportParser:
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 def main():
+    ap = argparse.ArgumentParser(description="PDF → 结构化 blocks（可选 Qwen-VL 复杂页解析）")
+    ap.add_argument("--vlm-mode", choices=["off", "complex", "all"], default=None,
+                    help="VLM 路由：off（默认）/complex（表格密集页+扫描页）/all（全部页）")
+    ap.add_argument("--vlm-max-pages", type=int, default=None,
+                    help="每份 PDF 的 VLM 页数上限，默认取 VLM_MAX_PAGES（60）")
+    ap.add_argument("--vlm-pages", type=str, default=None,
+                    help="显式指定页码（1-based，逗号分隔），优先于 --vlm-mode")
+    ap.add_argument("--vlm-sample", type=int, default=0,
+                    help="每份 PDF 只取前 N 张复杂页做 VLM 抽样，0=不限制")
+    ap.add_argument("--vlm-dpi", type=int, default=None, help="VLM 渲染 DPI，默认 150")
+    args = ap.parse_args()
+
+    vlm = VlmConfig()
+    if args.vlm_mode is not None:
+        vlm.mode = args.vlm_mode
+    if args.vlm_max_pages is not None:
+        vlm.max_pages = args.vlm_max_pages
+    if args.vlm_pages:
+        vlm.pages = {int(x) for x in args.vlm_pages.split(",") if x.strip()}
+    if args.vlm_sample:
+        vlm.sample = args.vlm_sample
+    if args.vlm_dpi is not None:
+        vlm.dpi = args.vlm_dpi
+    if vlm.enabled():
+        logger.info(
+            f"VLM 已启用：mode={vlm.mode} max_pages={vlm.max_pages} "
+            f"sample={vlm.sample} pages={sorted(vlm.pages) if vlm.pages else 'auto'}")
+
     manifest_path = RAW_DIR.parent / "manifest.json"
 
     if manifest_path.exists():
@@ -335,7 +496,7 @@ def main():
             logger.warning(f"文件不存在，跳过: {pdf_path}")
             continue
 
-        parser = AnnualReportParser(pdf_path, meta=item)
+        parser = AnnualReportParser(pdf_path, meta=item, vlm_config=vlm)
         parser.parse()
         parser.save()
 

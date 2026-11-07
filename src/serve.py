@@ -16,6 +16,7 @@ RAG 问答 HTTP 服务（FastAPI）
 
 import importlib.util
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -47,26 +48,37 @@ _module  = None   # 持有模块引用，供 debug 端点访问模块级函数
 pipeline = None   # RAGPipeline 实例
 
 
+def _env_float(name: str, default: float | None = None) -> float | None:
+    """读浮点环境变量；空串/未设置时回 default。"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _module, pipeline
     logger.info("服务启动，初始化 RAG Pipeline...")
     _module  = _load_pipeline_module()
+    index_dir = os.getenv("RAG_INDEX_DIR") or None
     pipeline = _module.RAGPipeline(
         use_bm25          = True,
-        # 打开精排：实测（v2 题集 25 题，scripts/ci/measure_rerank.py）
-        #   RRF top4 基线      Hit@4 0.360 / MRR@4 0.210
-        #   重排 top4          Hit@4 0.440 / MRR@4 0.293   （MRR 相对 +39.5%）
-        #   重排 + 下限 0.70   Hit@4 0.440 / MRR@4 0.293，上下文字符 −11.1%
-        # 阈值 0.7 是"质量不掉而上下文变短"的实测拐点；再往上（0.85/0.95）
-        # Hit 会塌到 0.32/0.12，所以不追求更大的削减比例。
-        # 代价：每请求多约 2.2 s（10 对候选的 CrossEncoder 推理）；
-        # 模型已改为进程级单例，不再每请求重付 5.8 s 加载。
+        # 精排打开，但分数下限默认关闭：
+        #   100 题实测（scripts/ci/measure_rerank.py --sample 100）
+        #   基线 RRF top4      Hit@4 0.560 / MRR@4 0.312
+        #   重排不过滤          Hit@4 0.550 / MRR@4 0.330
+        #   重排 + 下限 0.70    Hit@4 0.410 / MRR@4 0.261  ← 旧默认，已回退
+        # 0.7 是在 25 题子集上选的，100 题上会误杀大量正确文档。
+        # 要重新启用下限，先用 measure_rerank.py 在 100 题上确定新阈值。
         use_rerank        = True,
-        rerank_min_score  = 0.7,
+        rerank_min_score  = _env_float("RERANK_MIN_SCORE", None),
         use_query_rewrite = False,
+        index_dir         = index_dir,
     )
-    logger.info("Pipeline 初始化完成，开始接受请求")
+    logger.info(
+        f"Pipeline 初始化完成：索引={pipeline.index_dir} 策略={pipeline.strategy} "
+        f"rerank_min_score={pipeline.rerank_min_score}")
     yield
     logger.info("服务关闭")
 
@@ -179,7 +191,13 @@ def index():
 def health():
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
-    return {"status": "ok", "pipeline_ready": True}
+    return {
+        "status": "ok",
+        "pipeline_ready": True,
+        "index_dir": str(pipeline.index_dir),
+        "strategy": pipeline.strategy,
+        "rerank_min_score": pipeline.rerank_min_score,
+    }
 
 
 @app.post("/query", response_model=QueryResponse, summary="标准问答")
@@ -233,8 +251,12 @@ def query_debug(req: QueryRequest):
         else:
             candidates = vec_results
 
-        # ④ 取 Top-K 组装上下文（structured 分块下按 parent_id 拼父块全文）
-        final         = candidates[:TOP_K_FINAL]
+        # ④ 与 /query 完全同口径：精排 + 同阈值 + 父块拼装
+        if pipeline.use_rerank:
+            final = _module.rerank(
+                req.question, candidates, TOP_K_FINAL, pipeline.rerank_min_score)
+        else:
+            final = candidates[:TOP_K_FINAL]
         context, cits = _module.build_context(final, pipeline.parents)
 
         # ⑤ LLM 生成
@@ -276,7 +298,7 @@ def query_debug(req: QueryRequest):
             ContextChunk(
                 index=i+1,
                 source=_build_source(item),
-                content=item.get("parent_content") or item["content"],
+                content=_module.resolve_chunk_content(item, pipeline.parents),
             ) for i, item in enumerate(final)
         ],
         answer    = answer,

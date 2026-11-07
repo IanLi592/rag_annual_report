@@ -1,6 +1,6 @@
 {
-  "_comment": "CI 断言基线。数值来源见 docs/cicd_requirements.md §8 与 docs/resume_gap_plan.md §11，均为本机实测。2026-11-07 解析去重后重建主索引：10352 → 7942。",
-  "chunks_total": 7942,
+  "_comment": "CI 断言基线。数值来源见 docs/cicd_requirements.md §8 与 docs/resume_gap_plan.md §11，均为本机实测。2026-11-07 解析去重 + 页脚噪声清理后重建主索引：10352 → 7942 → 7931。",
+  "chunks_total": 7931,
   "embedding_dim": 1024,
   "pdf_count": 15,
   "companies": 5,
@@ -24,7 +24,9 @@
     "block_types",
     "is_ocr",
     "strategy",
-    "source_file"
+    "source_file",
+    "heading_level",
+    "table_json"
   ],
   "artifacts": {
     "faiss_index": "vectorstore/faiss_index.bin",

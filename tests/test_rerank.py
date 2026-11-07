@@ -163,5 +163,12 @@ def test_serve_enables_rerank_with_threshold():
     assert isinstance(kw.get("use_rerank"), ast.Constant) and kw["use_rerank"].value is True, \
         "use_rerank 没被打开"
     assert "rerank_min_score" in kw, "没配长尾过滤阈值"
-    assert isinstance(kw["rerank_min_score"], ast.Constant)
-    assert 0 < kw["rerank_min_score"].value < 1, f"阈值不在合理区间: {kw['rerank_min_score'].value}"
+    # 阈值改由 RERANK_MIN_SCORE 环境变量控制：默认 None（不误杀），
+    # 要启用必须先按 100 题重定。这里允许 None 或 _env_float(...) 两种写法。
+    value = kw["rerank_min_score"]
+    assert isinstance(value, (ast.Constant, ast.Call))
+    if isinstance(value, ast.Constant):
+        assert value.value is None or (isinstance(value.value, (int, float)) and 0 < value.value < 1)
+    else:
+        assert getattr(value.func, "id", "") == "_env_float", \
+            "rerank_min_score 既不是常量也不是 _env_float 读取"

@@ -41,7 +41,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 BASE_DIR        = Path(__file__).parent.parent
-VECTORSTORE_DIR = BASE_DIR / "vectorstore"
+# 默认主索引；RAG_INDEX_DIR 可指向 vectorstore/structured 等 A/B 索引
+VECTORSTORE_DIR = Path(os.getenv("RAG_INDEX_DIR") or (BASE_DIR / "vectorstore"))
 INDEX_PATH      = VECTORSTORE_DIR / "faiss_index.bin"
 META_PATH       = VECTORSTORE_DIR / "faiss_meta.json"
 # structured 分块的父块内容单独存放；子块只带 parent_id，避免整份复制
@@ -92,13 +93,17 @@ def match_filter(item: dict, filter_meta: Optional[dict]) -> bool:
 
 
 class VectorStore:
-    def __init__(self, client: OpenAI):
+    def __init__(self, client: OpenAI, index_dir: str | Path | None = None):
         import faiss
-        self.client    = client
-        self.index     = faiss.read_index(str(INDEX_PATH))
-        with open(META_PATH, encoding="utf-8") as f:
+        self.client = client
+        self.index_dir = Path(index_dir) if index_dir else VECTORSTORE_DIR
+        index_path = (self.index_dir / "faiss_index.bin") if index_dir else INDEX_PATH
+        meta_path = (self.index_dir / "faiss_meta.json") if index_dir else META_PATH
+        self.index     = faiss.read_index(str(index_path))
+        with open(meta_path, encoding="utf-8") as f:
             self.meta_list = json.load(f)
-        logger.info(f"FAISS 索引加载完成，共 {self.index.ntotal} 条向量")
+        logger.info(
+            f"FAISS 索引加载完成，共 {self.index.ntotal} 条向量（{self.index_dir}）")
 
     def _embed_query(self, query: str) -> np.ndarray:
         resp = self.client.embeddings.create(
@@ -146,7 +151,7 @@ class BM25Store:
     对精确数字、专有名词（如"净利润""研发费用"）效果优于纯向量检索。
     首次初始化会分词整个语料库，约需数秒。
     """
-    def __init__(self):
+    def __init__(self, meta_path: str | Path | None = None):
         from rank_bm25 import BM25Okapi
         import jieba
         from jieba_domain import load_domain_dict
@@ -154,7 +159,7 @@ class BM25Store:
         # 必须在任何分词之前注入，否则前缀词典已建好、后加的词不生效
         dict_stat = load_domain_dict(jieba)
 
-        with open(META_PATH, encoding="utf-8") as f:
+        with open(Path(meta_path) if meta_path else META_PATH, encoding="utf-8") as f:
             self.meta_list = json.load(f)
 
         logger.info(
@@ -337,6 +342,18 @@ def rewrite_query(query: str, client: OpenAI) -> str:
 
 # ── LLM 生成 ──────────────────────────────────────────────────────────────────
 
+def resolve_chunk_content(item: dict, parents: dict | None = None) -> str:
+    """取一条检索结果最终送进 LLM 的正文。
+
+    优先级：父块表（structured sidecar）→ 内联 parent_content（旧 hierarchical）
+    → 子块自身。`build_context` 与 `/query/debug` 必须共用这一份口径。
+    """
+    parents = parents or {}
+    return (parents.get(item.get("parent_id"))
+            or item.get("parent_content")
+            or item.get("content", ""))
+
+
 def build_context(retrieved: list[dict], parents: dict | None = None) -> tuple[str, list[dict]]:
     """将检索结果组装为 Prompt 上下文，返回上下文字符串和引用列表。
 
@@ -360,9 +377,7 @@ def build_context(retrieved: list[dict], parents: dict | None = None) -> tuple[s
         if page and page != -1:
             label += f" · 第{page}页"
 
-        content = (parents.get(item.get("parent_id"))
-                   or item.get("parent_content")
-                   or item.get("content", ""))
+        content = resolve_chunk_content(item, parents)
         parts.append(f"{label}\n{content}")
         citations.append({"index": i, "source": label, "chunk_id": item.get("chunk_id", "")})
 
@@ -395,22 +410,35 @@ class RAGPipeline:
         use_rerank:      bool = True,
         use_query_rewrite: bool = False,
         rerank_min_score: float | None = None,
+        index_dir:       str | Path | None = None,
     ):
         self.client        = get_client()
-        self.vec_store     = VectorStore(self.client)
+        self.index_dir     = Path(index_dir) if index_dir else VECTORSTORE_DIR
+        self.vec_store     = VectorStore(
+            self.client, index_dir=self.index_dir if index_dir else None)
         self.use_bm25      = use_bm25
         self.use_rerank    = use_rerank
         self.use_qr        = use_query_rewrite
-        # 长尾过滤阈值。默认 None = 与旧行为完全一致（只排序+截断）。
-        # 阈值来自 scripts/ci/measure_rerank.py 的实测分布，不是反推某个削减比例。
+        # 长尾过滤阈值。默认 None = 只排序+截断，不丢上下文。
+        # 0.7 曾在 25 题子集上看似"质量不掉"，但 100 题实测 Hit@4 0.560→0.410，
+        # 已不再是默认值；要启用必须先用 scripts/ci/measure_rerank.py 重定。
         self.rerank_min_score = rerank_min_score
-        self.bm25_store    = BM25Store() if use_bm25 else None
+        self.bm25_store    = (
+            BM25Store(meta_path=self.index_dir / "faiss_meta.json")
+            if use_bm25 and index_dir else
+            (BM25Store() if use_bm25 else None)
+        )
         # 父块查表：文件不存在（semantic 索引）时为空 dict，行为与旧版完全一致
+        parents_path = self.index_dir / "parents.json" if index_dir else PARENTS_PATH
         self.parents: dict = {}
-        if PARENTS_PATH.exists():
-            with open(PARENTS_PATH, encoding="utf-8") as f:
+        if parents_path.exists():
+            with open(parents_path, encoding="utf-8") as f:
                 self.parents = {p["parent_id"]: p["content"] for p in json.load(f)}
             logger.info(f"已载入父块 {len(self.parents)} 个（子块召回、父块拼装）")
+        self.strategy = (
+            self.vec_store.meta_list[0].get("strategy", "")
+            if self.vec_store.meta_list else ""
+        )
 
     def query(
         self,
@@ -475,12 +503,18 @@ def main():
     parser.add_argument("--query-rewrite", action="store_true", help="开启查询改写（增加一次 LLM 调用）")
     parser.add_argument("--no-bm25",       action="store_true", help="关闭 BM25（消融实验用）")
     parser.add_argument("--no-rerank",     action="store_true", help="关闭 Rerank（消融实验用）")
+    parser.add_argument("--rerank-min-score", type=float, default=None,
+                        help="精排分数下限；默认不过滤。启用前先用 measure_rerank.py 重定")
+    parser.add_argument("--index-dir",     type=str, default=None,
+                        help="索引目录；默认 vectorstore/，可指向 vectorstore/structured")
     args = parser.parse_args()
 
     pipeline = RAGPipeline(
         use_bm25         = not args.no_bm25,
         use_rerank       = not args.no_rerank,
         use_query_rewrite= args.query_rewrite,
+        rerank_min_score = args.rerank_min_score,
+        index_dir        = args.index_dir,
     )
 
     filter_meta = {}

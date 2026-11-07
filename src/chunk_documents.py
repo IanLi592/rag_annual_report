@@ -83,6 +83,7 @@ def chunk_semantic(
             "section":    " > ".join(buf[0]["section_path"]) if buf[0]["section_path"] else "",
             "block_types": list({b["block_type"] for b in buf}),
             "is_ocr":     any(b["is_ocr"] for b in buf),
+            "heading_level": buf[0].get("heading_level", 0),
         }
         return {"content": content, "metadata": meta}
 
@@ -115,6 +116,7 @@ def chunk_semantic(
                     "section":  " > ".join(block["section_path"]),
                     "block_types": ["table"],
                     "is_ocr":   block["is_ocr"],
+                    "heading_level": block.get("heading_level", 0),
                 }
             }
             continue
@@ -275,7 +277,9 @@ def chunk_structured(
     for key in order:
         grp = groups[key]
         section = " > ".join(key)
-        level = level_of(list(key))
+        # 优先用解析阶段显式标出的 H1/H2/H3；旧 parsed JSON 没有该字段时退回路径深度
+        levels = [b.get("heading_level", 0) for b in grp if b.get("heading_level", 0)]
+        level = max(levels) if levels else level_of(list(key))
 
         # 子块：段落累积 / 表格单独 / 标题并入下一段
         buf, buf_len = [], 0
@@ -298,17 +302,15 @@ def chunk_structured(
             if bt == "table":
                 pre = flush_buf()
                 if pre and len(pre) >= min_child:
-                    child_chunks.append(_mk_child(pre, b, pending_titles))
+                    child_chunks.append(_mk_child(pre, b, pending_titles, level))
                 pending_titles = []
                 summ = summarize_table(b.get("raw_table"), section)
                 if summ and len(summ) >= min_child // 2:
                     # 子块内容 = 摘要 + 原始 markdown 表格。
-                    # 为什么两份都要：实测（scripts/ci/measure_index_ab.py）发现
-                    # 只留摘要会让检索面塌掉 —— 旧实现里表格文字同时存在于
-                    # table 块和 text 块，那份"重复"实际在充当数据增强
-                    # （BM25 词频翻倍、向量侧多一个入口），去掉后 BM25 Hit
-                    # 从 0.400 掉到 0.304。块内同时带两份不增加块数，
-                    # 既恢复检索面，又保留摘要的语义信号与 table_json 的精确结构。
+                    # 为什么两份都要：旧实现里表格文字同时存在于 table 块和 text 块，
+                    # 去掉重复后 BM25 Hit@4 实测从 0.380 升到 0.400（§11），
+                    # 说明这份“重复”并不是必要的召回增强。块内同时带摘要与原始
+                    # markdown 不增加块数，既保留语义信号，又保留 table_json 的结构。
                     child_chunks.append({
                         "content": summ + "\n" + b["content"],
                         "metadata": {
@@ -316,6 +318,7 @@ def chunk_structured(
                             "section": section,
                             "block_types": ["table"],
                             "is_ocr": bool(b.get("is_ocr")),
+                            "heading_level": b.get("heading_level", 0) or level,
                             "table_json": clean_table(b.get("raw_table")),
                         },
                     })
@@ -326,23 +329,23 @@ def chunk_structured(
             if len(txt) > max_child:
                 pre = flush_buf()
                 if pre and len(pre) >= min_child:
-                    child_chunks.append(_mk_child(pre, b, pending_titles))
+                    child_chunks.append(_mk_child(pre, b, pending_titles, level))
                 pending_titles = []
                 for s0 in range(0, len(txt), max_child):
                     piece = txt[s0:s0 + max_child]
                     if len(piece) >= min_child:
-                        child_chunks.append(_mk_child(piece, b, []))
+                        child_chunks.append(_mk_child(piece, b, [], level))
                 continue
             if buf_len + len(txt) > max_child and buf:
                 c = flush_buf()
                 if c and len(c) >= min_child:
-                    child_chunks.append(_mk_child(c, b, pending_titles))
+                    child_chunks.append(_mk_child(c, b, pending_titles, level))
                 pending_titles = []
             buf.append(txt)
             buf_len += len(txt)
         tail = flush_buf()
         if tail and len(tail) >= min_child:
-            child_chunks.append(_mk_child(tail, grp[-1], pending_titles))
+            child_chunks.append(_mk_child(tail, grp[-1], pending_titles, level))
 
         if not child_chunks:
             continue
@@ -355,6 +358,7 @@ def chunk_structured(
             if acc_len + len(piece) > parent_cap and acc:
                 parents.append({"parent_id": pid, "content": "\n\n".join(acc),
                                 "section": section, "level": level,
+                                "heading_level": level,
                                 "page_start": page_start})
                 pid = str(uuid.uuid4())[:8]
                 acc, acc_len, page_start = [], 0, c["metadata"]["page_num"]
@@ -364,13 +368,14 @@ def chunk_structured(
         if acc:
             parents.append({"parent_id": pid, "content": "\n\n".join(acc),
                             "section": section, "level": level,
+                            "heading_level": level,
                             "page_start": page_start})
         children.extend(child_chunks)
 
     return children, parents
 
 
-def _mk_child(content: str, anchor: dict, titles: list[str]) -> dict:
+def _mk_child(content: str, anchor: dict, titles: list[str], heading_level: int = 0) -> dict:
     prefix = (" / ".join(titles) + "\n") if titles else ""
     return {
         "content": prefix + content,
@@ -379,6 +384,7 @@ def _mk_child(content: str, anchor: dict, titles: list[str]) -> dict:
             "section": " > ".join(anchor.get("section_path") or []),
             "block_types": ["text"],
             "is_ocr": bool(anchor.get("is_ocr")),
+            "heading_level": heading_level,
         },
     }
 

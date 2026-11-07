@@ -23,8 +23,8 @@ sh scripts/ci/run_all.sh --tier p0p1
 | 门 | 命令 | 查什么 | 需要 key |
 |---|---|---|---|
 | 静态 | `sh scripts/ci/check_static.sh` | 8 个文件 `py_compile` + 单进程 import 冒烟 | 否 |
-| 索引 | `sh scripts/ci/check_index.sh` | 13 条断言：10352×1024 自洽、必需字段存在、评测集题数与题型分布、真实 BM25 检索命中、**过滤语义在真实语料上生效** | 否 |
-| 单测 | `sh scripts/ci/check_tests.sh` | 80 条纯函数守卫（分块/引用格式化/RRF/指标计算/落盘/裁判配置/探针分类/归因工具） | 否 |
+| 索引 | `sh scripts/ci/check_index.sh` | 13 条断言：7931×1024 自洽、必需字段存在、评测集题数与题型分布、真实 BM25 检索命中、**过滤语义在真实语料上生效** | 否 |
+| 单测 | `sh scripts/ci/check_tests.sh` | 186 条纯函数守卫（分块/引用格式化/RRF/指标计算/落盘/裁判配置/探针分类/Qwen-VL 响应解析/拒答分类/索引选择/页眉页脚噪声） | 否 |
 | 服务 | `sh scripts/ci/check_service.sh --port 8011` | 拉起 uvicorn → 轮询 `/health` 到 200 → 关停并确认端口释放 | 是 |
 
 索引门的 `--allow-drift` 用于"你确实改了语料重建了索引"之后复核；长期基线改 `scripts/ci/baseline.json`。

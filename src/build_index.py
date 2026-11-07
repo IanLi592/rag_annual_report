@@ -98,6 +98,35 @@ def embed_texts(client: OpenAI, texts: list[str], show_progress: bool = True) ->
 
 # ── FAISS 索引构建 ─────────────────────────────────────────────────────────────
 
+def make_meta_list(chunks: list[dict]) -> list[dict]:
+    """把 chunks 转成索引侧元数据。
+
+    单独抽成纯函数：table_json / heading_level 这类字段最容易在
+    “chunk 里有、索引里没有”之间静默丢失，必须能离线断言。
+    """
+    return [
+        {
+            "chunk_id":   c["chunk_id"],
+            "content":    c["content"],
+            "stock_code": c["metadata"].get("stock_code", ""),
+            "year":       c["metadata"].get("year", ""),
+            "page_num":   c["metadata"].get("page_num", -1),
+            "section":    c["metadata"].get("section", ""),
+            "block_types":c["metadata"].get("block_types", []),
+            "is_ocr":     c["metadata"].get("is_ocr", False),
+            "strategy":   c["metadata"].get("strategy", ""),
+            "source_file":c["metadata"].get("source_file", ""),
+            "heading_level": c["metadata"].get("heading_level", 0),
+            # structured 分块的原始表格结构（二维数组），供精确提取
+            "table_json": c["metadata"].get("table_json"),
+            # 层级分块时保留父块内容供 LLM 读取
+            "parent_content": c["metadata"].get("parent_content", ""),
+            "parent_id":      c["metadata"].get("parent_id", ""),
+        }
+        for c in chunks
+    ]
+
+
 def build_faiss_index(chunks: list[dict], client: OpenAI, out_dir: Path = None):
     """
     构建 FAISS 向量索引。
@@ -131,24 +160,7 @@ def build_faiss_index(chunks: list[dict], client: OpenAI, out_dir: Path = None):
     faiss.write_index(index, str(index_path))
     logger.info(f"FAISS 索引已保存 → {index_path}  ({index_path.stat().st_size//1024} KB)")
 
-    meta_list = [
-        {
-            "chunk_id":   c["chunk_id"],
-            "content":    c["content"],
-            "stock_code": c["metadata"].get("stock_code", ""),
-            "year":       c["metadata"].get("year", ""),
-            "page_num":   c["metadata"].get("page_num", -1),
-            "section":    c["metadata"].get("section", ""),
-            "block_types":c["metadata"].get("block_types", []),
-            "is_ocr":     c["metadata"].get("is_ocr", False),
-            "strategy":   c["metadata"].get("strategy", ""),
-            "source_file":c["metadata"].get("source_file", ""),
-            # 层级分块时保留父块内容供 LLM 读取
-            "parent_content": c["metadata"].get("parent_content", ""),
-            "parent_id":      c["metadata"].get("parent_id", ""),
-        }
-        for c in chunks
-    ]
+    meta_list = make_meta_list(chunks)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta_list, f, ensure_ascii=False, indent=2)
     logger.info(f"元数据已保存 → {meta_path}")

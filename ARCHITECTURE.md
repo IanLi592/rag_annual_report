@@ -69,13 +69,20 @@ PDF 解析（文字 + 表格 + OCR + 章节结构）
 - `table`：直接转为 Markdown 格式（方便 LLM 读取）
 - `text`：正常文本段落
 
-每个块保留完整元数据：`page_num`、`section_path`（章节路径栈）、`is_ocr`、`block_type`。
+每个块保留完整元数据：`page_num`、`section_path`（章节路径栈）、`is_ocr`、
+`heading_level`（H1/H2/H3，0=非标题）、`parser`（rule/vlm/ocr）。
+
+**Qwen-VL 分支（可选，默认关闭）**：只处理规则解析容易坏的页——表格密集页
+（≥2 张表或表格面积占比 ≥20%）与扫描页。走 DashScope OpenAI 兼容接口，
+输出同样是 `title/text/table` 块，表格保留 `raw_table` 二维结构。开关由
+`VLM_MODE=off|complex|all` 或 `--vlm-mode/--vlm-pages` 控制；有
+`VLM_MAX_PAGES` 硬预算、按页缓存（`data/vlm_cache/`）、任何失败逐页回退规则解析。
 
 ---
 
 ### 3.3 文档分块（Chunking）
 
-提供三种策略，通过修改 `STRATEGY` 变量切换：
+提供四种策略，通过 `--strategy` 或脚本顶部 `STRATEGY` 变量切换：
 
 #### 策略 A：固定大小分块（`fixed`）
 ```
@@ -102,7 +109,19 @@ chunk_size=500字符，overlap=50字符
 - 子块用于精确向量匹配，父块内容在检索时附加给 LLM 作为扩展上下文
 - 即"Small-to-Big"检索策略，缓解长文档召回粒度不匹配问题
 
-**实际产出**（语义分块）：7,942 个 chunks，平均 526 字符（2026-11-07 解析去重后；去重前 10,352）
+#### 策略 D：结构化章节树（`structured`）
+```
+子块：段落/表格（≤800 字符），只带 parent_id
+父块：整章拼接（≤2000 字符），单独写入 parents.json
+```
+- 表格子块 = 表格摘要 + 原始 Markdown，原始二维结构进 `metadata.table_json`
+- `heading_level` 优先取解析阶段显式的 H1/H2/H3，缺失时退回 `section_path` 深度
+- 检索时"子块召回、父块拼装"：`rag_pipeline.resolve_chunk_content` 按
+  `parent_id` 查 `parents.json`，查不到再退回内联 `parent_content` / 子块自身
+- 落盘到 `vectorstore/structured/`，通过 `RAG_INDEX_DIR` 或 `--index-dir` 切换；
+  **不设为默认**——100 题实测混合检索上弱于 semantic（见 `docs/resume_gap_plan.md` §11）
+
+**实际产出**（语义分块）：7,931 个 chunks，平均 526 字符（2026-11-07 解析去重后；去重前 10,352）
 
 ---
 
@@ -138,7 +157,7 @@ resp = client.embeddings.create(
 **FAISS IndexFlatIP**（精确内积检索）
 
 ```
-检索时间：7,942 条向量 × 1024 维 → 单次查询 < 1ms
+检索时间：7,931 条向量 × 1024 维 → 单次查询 < 1ms
 ```
 
 选型原因：
@@ -149,7 +168,7 @@ resp = client.embeddings.create(
 扩展路径：数据量 > 50 万时可换 `IndexIVFFlat`（需 `train`）或 `IndexHNSWFlat`（无需 train）。
 
 **文件产出**：
-- `vectorstore/faiss_index.bin`：索引，31.02 MiB（7,942 × 1024 × 4 bytes = 32,530,432，实测文件 32,530,477 字节）
+- `vectorstore/faiss_index.bin`：索引，30.98 MiB（7,931 × 1024 × 4 bytes = 32,530,432，实测文件 32,485,421 字节）
 - `vectorstore/faiss_meta.json`：元数据，11.52 MiB（含每条 chunk 的文本和溯源信息）
 
 ---

@@ -267,22 +267,42 @@ def run_ragas_eval(results: list[dict], pipeline_name: str) -> dict:
 # ── 按题型分析 ────────────────────────────────────────────────────────────────
 
 def analyze_by_type(results: list[dict]):
-    """统计不同题型的基本表现（简单版：看有多少题拒绝回答了 should_refuse）。"""
+    """按题型统计；拒答单独区分“真拒答 / 空检索 / 正常回答”。
+
+    旧实现只用 `无法回答` 等关键词，且不区分 n_ctx=0 —— 检索失败会被算成
+    模型拒答。这里复用 src/refusal.py 的同一套判定，避免两份口径。
+    """
     from collections import defaultdict
+
+    try:
+        from refusal import classify_refusal
+    except ImportError:  # src 还没进 sys.path（直接跑本函数时）
+        sys.path.insert(0, str(BASE_DIR / "src"))
+        from refusal import classify_refusal
 
     type_stats = defaultdict(list)
     for r in results:
         qtype  = r.get("question_type", "unknown")
         answer = r.get("answer", "")
-        # 简单判断：是否含有拒绝关键词
-        refused = any(kw in answer for kw in ["无法回答", "无法提供", "不在", "不包含", "超出"])
-        type_stats[qtype].append({"refused": refused, "answer_len": len(answer)})
+        n_ctx  = len(r.get("contexts") or [])
+        type_stats[qtype].append({
+            "category": classify_refusal(answer, n_ctx),
+            "answer_len": len(answer),
+        })
 
     print("\n── 按题型统计 ──")
     for qtype, stats in type_stats.items():
-        refuse_rate = sum(1 for s in stats if s["refused"]) / len(stats)
-        avg_len     = sum(s["answer_len"] for s in stats) / len(stats)
-        print(f"  {qtype:<25} 题数={len(stats)}  拒绝率={refuse_rate:.0%}  平均回答长度={avg_len:.0f}字")
+        n = len(stats)
+        refused = sum(1 for s in stats if s["category"] == "refused_with_context")
+        empty = sum(1 for s in stats if s["category"] == "empty_context")
+        answered = sum(1 for s in stats if s["category"] == "answered")
+        judgeable = n - empty
+        avg_len = sum(s["answer_len"] for s in stats) / max(n, 1)
+        print(
+            f"  {qtype:<25} 题数={n}  "
+            f"真拒答={refused} 空检索={empty} 回答={answered}  "
+            f"可判定拒答率={(refused/judgeable if judgeable else 0):.0%}  "
+            f"平均长度={avg_len:.0f}字")
 
 
 # ── 保存结果 ──────────────────────────────────────────────────────────────────

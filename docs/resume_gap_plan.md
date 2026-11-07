@@ -24,22 +24,23 @@
 | # | 简历原文 | 代码现状 | 判定 |
 |---|---|---|---|
 | 1 | 向量/BM25 召回 → RRF 多路融合 | ✅ `rag_pipeline.py:360/366/198` | **成立** |
-| 2 | → BGE-Reranker 重排，形成两阶段漏斗 | ✅ **已打开**（`serve.py:55-66` `use_rerank=True, rerank_min_score=0.7`），模型改为进程级单例。评估路径 `evaluate.py` 仍关（见 §9 说明） | **服务路径已成立** |
+| 2 | → BGE-Reranker 重排，形成两阶段漏斗 | ✅ **已打开**（`serve.py` `use_rerank=True`），模型改为进程级单例；分数下限默认关闭，由 `RERANK_MIN_SCORE` 控制，待 100 题重定（§12） | **服务路径已成立，阈值待重定** |
 | 3 | Embedding 环节加入领域词表（扣非净利润/商誉减值）防切词粉碎 | ❌ 全仓无 `load_user_dict`/`add_word`，jieba 用默认词典 | **缺失** |
 | 4 | 通过重排过滤长尾低分文档，上下文 Token 削减 40% | ❌ 无任何测量 | **数字无依据** |
 | 5 | MRR@K 命中提升 15% 以上 | ❌ 消融脚本 `compare_strategies.py` 存在但从未跑过 | **数字无依据** |
-| 6 | 引入视觉大模型 Qwen-VL 重构 PDF 解析流水线 | ❌ 全仓无 qwen-vl/vision/multimodal；现方案是 pdfplumber + PyMuPDF + 可选 pytesseract | **完全缺失** |
-| 7 | 复杂表格结构化为 JSON 入库 | ⚠️ 有 `block_type=table` 的块，但 content 是**拍平的文本**，不是结构化 JSON | **需实现** |
-| 8 | Embedding 前设计「表格摘要注入机制」，提升向量召回、保留原始结构供精确提取 | ❌ 没有；而且**现状与它相反** —— 表格内容被同时写进 `table` 和 `text` 两种块，约 **4,491 块重复**，README/ARCHITECTURE 自己把它记为**已知问题** | **缺失，且现状是反面** |
+| 6 | 引入视觉大模型 Qwen-VL 重构 PDF 解析流水线 | ✅ 已实现可选分支（`src/parse_pdf_vlm.py`）：复杂页路由、JSON 块输出、按页缓存、预算上限、失败回退；默认 `VLM_MODE=off` | **机制成立；尚未全量跑，效果待抽样实测** |
+| 7 | 复杂表格结构化为 JSON 入库 | ✅ `block_type=table` 的块保留 `raw_table`，structured 子块写入 `metadata.table_json`，并进入 `faiss_meta.json` | **成立（structured 索引）** |
+| 8 | Embedding 前设计「表格摘要注入机制」，提升向量召回、保留原始结构供精确提取 | ✅ `chunk_structured`：表格子块 = 摘要文本（供 embedding）+ 原始 Markdown（保检索面），`table_json` 供精确提取；解析层表格重复发射已修 | **机制成立；增益无支持性数据（§11）** |
 | 9 | 核心财务指标检索准确率提升 25% 以上 | ❌ 无测量 | **数字无依据** |
-| 10 | 基于 PyMuPDF 提取标题层级 H1/H2/H3 | ⚠️ 有层级推断（`parse_pdf.py:174` 章节栈 + 字号/加粗判标题），但产出是 `section_path` 字符串列表，**没有 H1/H2/H3 显式分级** | **措辞可对齐** |
-| 11 | 语义 + 结构树递归分块 Parent-Child | ⚠️ `chunk_hierarchical`（`chunk_documents.py:142`）存在，但父/子块是**按字符窗口定长切**（2000/400），不是按结构树；且默认策略是 `semantic`，当前索引 10352 块 **100% 是 semantic** | **需实现真结构树** |
-| 12 | 检索时「子块召回、父块拼装」 | ⚠️ 代码在 `rag_pipeline.py:310`（`parent_content or content`），但实测当前索引 `parent_id` 与 `parent_content` **全为空（0/10352）** → 这条分支**永不触发，是死路径** | **需重建索引才成立** |
+| 10 | 基于 PyMuPDF 提取标题层级 H1/H2/H3 | ✅ `classify_heading` / `ParsedBlock.heading_level`；章节栈显式记录 H1/H2/H3，随块进入 chunk/index | **成立** |
+| 11 | 语义 + 结构树递归分块 Parent-Child | ✅ `chunk_structured`：按 `section_path` 建章节树，父块单独存 `parents.json`，子块只留 `parent_id`；索引在 `vectorstore/structured/` | **机制成立；未晋升默认（§11）** |
+| 12 | 检索时「子块召回、父块拼装」 | ✅ `resolve_chunk_content` 按 `parent_id` 查父块表，主链路与 `/query/debug` 同口径；semantic 索引无 parents.json 时行为不变 | **structured 路径成立** |
 | 13 | 系统提示词强制仅依据检索内容作答并标注来源编号 | ✅ `rag_pipeline.py:57` 五条规则，含拒答与 `[n]` 引用 | **成立** |
 | 14 | 应拒绝回答类实现 100% 拒答正确率 | ⚠️ 度量机制在（`evaluate.py:257-262` 关键词判 refused，算 refuse_rate），但**只有 3 道该类题，且从未跑出过数字** | **需扩题+实测** |
 | 15 | 设计 100+ 道题（幻觉对抗/多跳推理/数字计算/应拒绝回答四类）；RAGAS 接入 CI，每次调整 Chunk 大小或 Prompt 后自动输出对比报告 | ❌ 实际 **20 题、5 类**（simple_fact/precise_number/cross_doc_compare/time_trend/should_refuse）；⚠️ RAGAS 已接 CI（`run_eval.sh` + 探针 + 预检），但**不会在 chunk/prompt 变更时自动触发，也没有 baseline vs new 对比报告** | **规模缺失 + 自动化缺失** |
 
-**统计**：成立 3 条 ｜ 半成立/需对齐措辞 4 条 ｜ 机制缺失 5 条 ｜ 数字无依据 4 条（含与机制缺失重叠）
+**统计（初审时）**：成立 3 条 ｜ 半成立/需对齐措辞 4 条 ｜ 机制缺失 5 条 ｜ 数字无依据 4 条（含与机制缺失重叠）。
+P0 代码落地后，第 6/7/8/10/11/12 条机制已补，**数字项仍需统一重测**（见 §12）。
 
 ---
 
@@ -428,24 +429,34 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 | 方案 | chunks | 内容 sha | Hit@4 | MRR@4 |
 |---|---|---|---|---|
 | semantic_old（旧线上索引） | 10352 | 706fe1c713 | 0.380 | 0.196 |
-| semantic_new（解析去重后） | 7942 | b43aa7d963 | **0.400** | **0.208** |
-| structured（摘要+章节树） | 7831 | f566ec0ffa | **0.410** | **0.217** |
+| semantic_new（解析去重 + 页脚清理） | 7931 | 31d2f07b4b | **0.400** | **0.208** |
+| structured（摘要+章节树，新分块） | 6698 | 6408956a26 | **0.390** | **0.205** |
 
-去重 **+2.0pp**（不是 −9.6pp），structured 再 +1.0pp。两遍重复测量完全一致。
+去重/清理 **+2.0pp**；structured 的 BM25 单路比 semantic_new 低 1.0pp，MRR 也略低（0.205 vs 0.208）。
+两遍重复测量完全一致。
 
-### 但混合检索上 structured 输 20pp —— 所以不晋升
+### 混合检索重测（新分块 + 显式 H1/H2/H3，36 数值题 / 100 题）
 
-| 口径（40 题，hybrid） | Hit@4 | MRR@4 | 上下文字符 |
+旧表（40 题，旧 structured）显示 structured 输 20pp；新分块把 section_path
+从 4 级压到显式 3 级、并清掉页脚页码后，structured 降到 6698 块重测：
+
+| 口径（36 数值题，hybrid） | semantic Hit@4 | structured Hit@4 | 差值 |
 |---|---|---|---|
-| semantic | 0.500 | 0.275 | 3428 |
-| structured | 0.300 | 0.154 | 3839 |
+| 无重排 | 0.500 | 0.444 | −5.6pp |
+| 重排（不过滤） | 0.500 | **0.583** | **+8.3pp（相对 +16.6%）** |
+| 重排 + 下限 0.70 | 0.389 | **0.500** | **+11.1pp** |
 
-BM25 赢、hybrid 输 → 回归全在**向量侧**：摘要+拆段后的子块 embedding 效果
-不如 semantic 的整段块，且块数更少、检索面更窄。上下文还变长 12%（父块拼装）。
+数值题上 structured + 重排确实赢，但 **100 题整体**仍是 semantic 更好：
 
-**决定：structured 保留为可选策略（`--strategy structured`，索引在
+| 口径（100 题，hybrid + 重排） | Hit@4 | MRR@4 | 上下文字符 |
+|---|---|---|---|
+| semantic | **0.550** | **0.330** | 4158 |
+| structured | 0.520 | 0.317 | 4331（+4.2%） |
+
+**决定不变：structured 保留为可选策略（`--strategy structured`，索引在
 `vectorstore/structured/`），不设为默认、不晋升主索引。** 简历里"表格摘要注入提升 25%"
-与"Parent-Child 解决上下文断层"这两句，目前**没有支持性数据**，不能写进结论。
+若指数值题，实测是 **+16.6% 相对 / +8.3pp 绝对**（仅重排口径，36 题），达不到 25%；
+"Parent-Child 解决上下文断层"则没有支持性数据（上下文反而 +4.2%~+37.1%）。
 
 ### 解析去重修复本身是真收益，已晋升
 
@@ -467,3 +478,21 @@ BM25 赢、hybrid 输 → 回归全在**向量侧**：摘要+拆段后的子块 
 - `src/rag_pipeline.py` —— 确定性排序；`get_reranker` 单例；`build_context(..., parents)`
   支持按 parent_id 拼父块；`RAGPipeline` 载入 `vectorstore/parents.json`
 - `tests/test_chunk_structured.py` 13 条（含"子块内容必须是其父块内容子串"这条结构不变量）
+
+---
+
+## 12. P0 代码落地状态（2026-11-07，指标待统一重测）
+
+本轮只改代码与口径，**不重测、不调阈值**；所有百分比等全部代码稳定后统一测量，
+避免"边改边测"导致前后不可比。
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| P0-1 重排阈值 | ✅ 已重定，结论：**继续关闭下限** | 100 题（`measure_rerank_100_20261107b.log`）：基线 Hit@4 0.560 / MRR@4 0.312；重排不过滤 0.550 / 0.330（字符 +25.8%）；下限 0.30→0.90 每一档 Hit 都下降，0.70 为 0.410 / 0.261（字符 −16.0%）。没有任何阈值能同时提升 Hit 和削减上下文，故 `RERANK_MIN_SCORE` 默认仍为 `None` |
+| P0-2 Qwen-VL | ✅ 实现，默认关闭 | `src/parse_pdf_vlm.py`；`parse_pdf.py --vlm-mode/--vlm-pages/--vlm-sample`，按页缓存 + 预算上限 + 失败回退 |
+| P0-3 结构化接入 | ✅ 索引与分析链路打通，**不晋升默认** | `table_json` / `heading_level` 进 chunk metadata 与索引 meta；`parents.json` sidecar；`RAG_INDEX_DIR` / `--index-dir` 切换 |
+| P0-4 Parent-Child 拼装 | ✅ structured 路径生效 | `resolve_chunk_content`（父块表 → 内联 parent_content → 子块），`/query/debug` 与主链路同口径 |
+| P0-5 拒答口径 | ✅ 三分类 + 25 题实测 | `src/refusal.py`：真拒答 / 空检索 / 正常回答；重测（`refusal_measure_20261107b.log`）：served 与 eval 均 **25/25 真拒答，0 空检索**，可判定题拒答率 100% |
+
+**仍需在统一重测后回填的数字**：Token 削减比例、MRR@K / Hit@K 前后差、核心财务指标
+准确率、拒答正确率、100 题基线与 structured A/B。代码完成 ≠ 简历数字成立。

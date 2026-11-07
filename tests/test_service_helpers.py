@@ -54,6 +54,25 @@ def test_preview_strips_before_measuring():
     assert serve._preview("   ") == ""
 
 
+# ── _env_float ───────────────────────────────────────────────────────────────
+
+def test_env_float_default_when_unset(monkeypatch):
+    monkeypatch.delenv("RERANK_MIN_SCORE", raising=False)
+    assert serve._env_float("RERANK_MIN_SCORE", None) is None
+    assert serve._env_float("RERANK_MIN_SCORE", 0.75) == 0.75
+
+
+def test_env_float_blank_is_treated_as_unset(monkeypatch):
+    """docker-compose 里 `RERANK_MIN_SCORE=` 会传空串，不能当成 float("") 崩掉。"""
+    monkeypatch.setenv("RERANK_MIN_SCORE", "  ")
+    assert serve._env_float("RERANK_MIN_SCORE", None) is None
+
+
+def test_env_float_parses_override(monkeypatch):
+    monkeypatch.setenv("RERANK_MIN_SCORE", "0.82")
+    assert serve._env_float("RERANK_MIN_SCORE", None) == 0.82
+
+
 # ── _filter_meta ─────────────────────────────────────────────────────────────
 
 def test_filter_meta_returns_none_when_no_filters():

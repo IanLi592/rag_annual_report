@@ -34,7 +34,7 @@
 
 **P0-2 索引一致性门（pre-push，读本地现成产物）**
 断言 `vectorstore/faiss_index.bin` 的 `ntotal` / `d` 与 `faiss_meta.json` 条数三者自洽，并与基线常量对齐；再跑一次真实 BM25 中文检索，断言命中数 > 0 且 Top1 带上 `bm25_score`。这一档**本地独有**（云端没有索引）。
-**断言必须先校验字段存在性**：实测踩过 —— `faiss_meta.json` 里**没有** `company_name` / `block_type`（真实字段是 `chunk_id / content / stock_code / year / page_num / section / block_types / is_ocr / strategy / source_file / parent_content / parent_id`），用 `.get()` 取值会得到 `None` 并**静默通过**。规约：每条字段断言前先把缺失字段列成断言失败项，禁止裸 `.get()`。
+**断言必须先校验字段存在性**：实测踩过 —— `faiss_meta.json` 里**没有** `company_name` / `block_type`（真实字段是 `chunk_id / content / stock_code / year / page_num / section / block_types / is_ocr / strategy / source_file / parent_content / parent_id / heading_level / table_json`），用 `.get()` 取值会得到 `None` 并**静默通过**。规约：每条字段断言前先把缺失字段列成断言失败项，禁止裸 `.get()`。
 
 **P0-3 钩子版本化**
 新增 `scripts/git-hooks/{pre-commit,pre-push}` + 一次性 `git config core.hooksPath scripts/git-hooks` + `git update-index --chmod=+x`。附一份 `scripts/git-hooks/README.md` 写明换机器要重跑的两条命令。
@@ -92,7 +92,7 @@
 CI 的断言基线（"金标准"），来自 README 自述 + 本轮实测，落成 `scripts/ci/baseline.json` 一个文件：
 
 ```
-chunks_total      10352        # faiss ntotal == meta 条数
+chunks_total      7931         # faiss ntotal == meta 条数（2026-11-07 解析去重后；旧值 10352）
 embedding_dim     1024         # faiss d
 companies         5
 years             2021,2022,2023
@@ -210,7 +210,7 @@ P2-1、P2-2、P2-3。（P2-4/P2-5 默认不做。）
 | 4 | `rag_pipeline.BM25Store()` 建库 | **12.01 s**（jieba 词典 0.43 s）；日志 `BM25 索引完成` |
 | 5 | 真实检索 `"贵州茅台 2021 年营业收入"` top-10 | 命中 **10** 条，耗时 **0.03 s**，Top1 `bm25_score=31.77` |
 | 6 | **反向验证**：把期望 ntotal 从 10352 改成 10351 | 断言**如期变红**（`基线不符: ntotal=10352(期望10351)`），证明这条守卫不是空转 |
-| 7 | **字段名静默通过演示** | 用 `company_name` / `block_type` 取值 → **None 且不报错**。真实字段为 `chunk_id / content / stock_code / year / page_num / section / block_types / is_ocr / strategy / source_file / parent_content / parent_id`。已据此给 P0-2 加规约 |
+| 7 | **字段名静默通过演示** | 用 `company_name` / `block_type` 取值 → **None 且不报错**。真实字段为 `chunk_id / content / stock_code / year / page_num / section / block_types / is_ocr / strategy / source_file / parent_content / parent_id / heading_level / table_json`。已据此给 P0-2 加规约 |
 | 8 | `uvicorn serve:app --port 8011`（无 key） | **退出码 3**，`OSError: 请设置环境变量 DASHSCOPE_API_KEY`（`rag_pipeline.py:309 → :72`）；`GET /health` → `http=000`（连接被拒，服务没起来） |
 | 9 | `evaluate.py --question-ids 1 --skip-ragas`（无 key） | 走到 `evaluate.py:68` 构造 `RAGPipeline` 才因同一个 key 报错，退出码 1。**说明 ragas 的 import 修复没有把脚本堵在前面** |
 

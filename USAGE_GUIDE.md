@@ -121,13 +121,24 @@ python src/parse_pdf.py
 1. 遍历 `manifest.json` 中每个 PDF
 2. 每页同时用 pdfplumber（表格）和 PyMuPDF（文字+字体）处理
 3. 判断扫描页：文字少于 50 字且含图片 → 调用 OCR（未安装 tesseract 时跳过并留占位符）
-4. 表格转为 Markdown 格式，标题按字体大小/加粗识别，维护章节路径栈
+4. 表格转为 Markdown 格式，标题按编号规律/字体大小识别 H1/H2/H3，维护章节路径栈
 5. 输出每个 PDF 对应的 JSON 文件
+
+**可选：Qwen-VL 复杂页解析**（表格密集页 / 扫描页，默认关闭）：
+```bash
+python src/parse_pdf.py --vlm-mode complex          # 只把复杂页交给 qwen-vl-max
+python src/parse_pdf.py --vlm-pages 21,22,23        # 只解析指定页（1-based）
+python src/parse_pdf.py --vlm-sample 5              # 每份 PDF 抽样 5 张复杂页做验证
+python src/parse_pdf.py --vlm-mode all --vlm-max-pages 10   # 全页模式 + 硬预算
+```
+- 需要 `DASHSCOPE_API_KEY`；没有 key 或调用失败时**逐页回退规则解析**，不会中断整份年报
+- 结果缓存在 `data/vlm_cache/<pdf名>/page_XXXX.json`，重跑不重复计费
+- 环境变量：`VLM_MODE=off|complex|all`、`VLM_MAX_PAGES=60`、`VLM_DPI=150`、`VLM_MODEL=qwen-vl-max`
 
 **预期输出**：
 ```
 data/parsed/
-  600519_2023_贵州茅台_贵州茅台2023年年度报告.json   # 约 1,660 个 blocks
+  600519_2023_贵州茅台_贵州茅台2023年年度报告.json   # 约 1,308 个 blocks
   601318_2023_中国平安_中国平安2023年年度报告.json   # 约 7,550 个 blocks（平安表格最多）
   ... （共 15 个 JSON）
 ```
@@ -154,26 +165,24 @@ data/parsed/
 ### 步骤 3：文档分块
 
 ```bash
-python src/chunk_documents.py
+python src/chunk_documents.py                       # 默认 semantic
+python src/chunk_documents.py --strategy structured # 表格摘要 + 章节树 Parent-Child
 ```
 
-**控制参数**（修改脚本顶部变量）：
+**控制参数**：`--strategy` 优先，未传时取脚本顶部 `STRATEGY` 变量。
 
-```python
-STRATEGY = "semantic"   # 可选: "fixed" | "semantic" | "hierarchical"
-```
-
-**三种策略的区别**：
+**四种策略的区别**：
 
 | 策略 | 切割依据 | chunk 大小 | 适合场景 |
 |------|---------|-----------|---------|
 | `fixed` | 每 500 字符截断，overlap=50 | 均匀 | Baseline 对比 |
 | `semantic` | 遇标题强制切，段落合并不超 800 字 | 不均匀 | 默认，语义完整 |
 | `hierarchical` | 父块（完整章节）+ 子块（细粒度）| 双层 | 长文档精确召回 |
+| `structured` | 章节树 Parent-Child；表格子块=摘要+原始结构，父块单独存 | 子块≤800 / 父块≤2000 | 表格取数、上下文补全 |
 
 **预期输出**：
 ```
-data/chunks/all_semantic.json   # 10,352 个 chunks，文件 14.96 MiB（实测 15,687,726 字节）
+data/chunks/all_semantic.json   # 7,931 个 chunks，文件 11.42 MiB（实测 11,973,715 字节）
 ```
 
 每个 chunk 的格式：
@@ -188,42 +197,51 @@ data/chunks/all_semantic.json   # 10,352 个 chunks，文件 14.96 MiB（实测 
     "section": "第十节 > 二、财务报表 > 利润表",
     "block_types": ["text"],
     "is_ocr": false,
+    "heading_level": 3,
     "strategy": "semantic",
     "source_file": "600519_2023_贵州茅台_贵州茅台2023年年度报告.pdf"
   }
 }
 ```
 
+`structured` 策略的子块额外带 `parent_id`、`table_json`（表格原始二维结构），
+父块写入 `data/chunks/*_structured_parents.json` 并在建索引时合并到
+`vectorstore/structured/parents.json`。
+
 ---
 
 ### 步骤 4：构建向量索引
 
 ```bash
-python src/build_index.py
+python src/build_index.py                                   # 主索引（semantic）
+python src/build_index.py --strategy structured --out-dir vectorstore/structured
 ```
 
+`--out-dir` 用于给新策略单独落盘，验证完成前不覆盖线上索引。structured 索引
+会额外写 `parents.json`（父块全文），检索时按子块的 `parent_id` 查表拼装。
+
 **内部流程**：
-1. 加载 `data/chunks/all_semantic.json`（10,352 条）
-2. 按批次（10 条/批，共 ~1036 批）调用 DashScope text-embedding-v3
+1. 加载 `data/chunks/all_semantic.json`（7,931 条）
+2. 按批次（10 条/批，共 ~794 批）调用 DashScope text-embedding-v3
 3. 对所有向量做 L2 归一化（使内积等价于余弦相似度）
 4. 构建 FAISS IndexFlatIP，批量 add 归一化向量
 5. 分别保存索引文件和元数据
 
-**耗时与费用**：约 5~10 分钟；10,352 条 × 平均 50 token ≈ 50 万 token ≈ **约 0.35 元**
+**耗时与费用**：约 5~10 分钟；7,931 条 × 平均 50 token ≈ 40 万 token ≈ **约 0.35 元**
 
 **预期输出**：
 ```
-vectorstore/faiss_index.bin   # 40.44 MiB（10352 × 1024 × 4 bytes）
-vectorstore/faiss_meta.json   # 14.98 MiB（每条 chunk 的文本 + 溯源元数据）
+vectorstore/faiss_index.bin   # 30.98 MiB（7931 × 1024 × 4 bytes）
+vectorstore/faiss_meta.json   # 11.61 MiB（每条 chunk 的文本 + 溯源元数据）
 ```
 
 **进度日志**（每 100 批打印一次）：
 ```
-2026-04-16 [INFO] Embedding 进度: 100/1036 批
-2026-04-16 [INFO] Embedding 进度: 200/1036 批
+2026-11-07 [INFO] Embedding 进度: 100/794 批
+2026-11-07 [INFO] Embedding 进度: 200/794 批
 ...
-2026-04-16 [INFO] 索引构建完成，共 10352 条向量
-2026-04-16 [INFO] FAISS 索引已保存 → vectorstore/faiss_index.bin  (41408 KB)
+2026-11-07 [INFO] 索引构建完成，共 7931 条向量
+2026-11-07 [INFO] FAISS 索引已保存 → vectorstore/faiss_index.bin  (31724 KB)
 ```
 
 ---
@@ -246,7 +264,15 @@ python src/rag_pipeline.py --query "茅台最近怎么样" --query-rewrite
 # 消融测试：关闭 BM25 或 Rerank
 python src/rag_pipeline.py --query "..." --no-bm25
 python src/rag_pipeline.py --query "..." --no-rerank
+
+# 切到 structured 索引 / 启用精排分数下限
+python src/rag_pipeline.py --query "..." --index-dir vectorstore/structured
+python src/rag_pipeline.py --query "..." --rerank-min-score 0.80
 ```
+
+`--rerank-min-score` 默认不设（只排序+截断，不丢上下文）。旧默认 0.70 是在
+25 题子集上选的，100 题实测 Hit@4 从 0.560 降到 0.410，已回退；启用前先用
+`python scripts/ci/measure_rerank.py --sample 100` 重定阈值。
 
 **内部流程**（以默认配置为例）：
 
@@ -351,7 +377,7 @@ uvicorn serve:app --host 0.0.0.0 --port 8000
 启动日志：
 ```
 服务启动，初始化 RAG Pipeline...
-FAISS 索引加载完成，共 10352 条向量
+FAISS 索引加载完成，共 7931 条向量
 构建 BM25 索引（分词中，请稍候）...
 BM25 索引完成
 Pipeline 初始化完成，开始接受请求
@@ -360,6 +386,13 @@ INFO:     Uvicorn running on http://0.0.0.0:8000
 ```
 
 FAISS 和 BM25 只在启动时加载一次，之后每次请求只需 2 次 DashScope API 调用。
+
+服务启动时的可切换项（环境变量）：
+```bash
+RAG_INDEX_DIR=../vectorstore/structured   # 切索引目录；不设则用 vectorstore/
+RERANK_MIN_SCORE=0.80                     # 精排分数下限；不设 = 不过滤（默认）
+```
+`/health` 会回显 `index_dir`、`strategy`、`rerank_min_score`，用于确认线上实际加载的是哪套索引。
 
 开发模式（修改代码后自动重载）：
 ```bash
