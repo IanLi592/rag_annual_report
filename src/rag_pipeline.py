@@ -29,6 +29,7 @@ RAG 问答流水线（原生实现）
 """
 
 import os
+import re
 import json
 import logging
 import argparse
@@ -354,6 +355,58 @@ def resolve_chunk_content(item: dict, parents: dict | None = None) -> str:
             or item.get("content", ""))
 
 
+_CELL_WS = re.compile(r"\s+")
+_LABEL_PREFIX = re.compile(r"^(?:其中|加|减)[:：]?")
+_LABEL_UNIT = re.compile(r"[（(](?:元|万元|亿元|%|％)[）)]$")
+
+
+def _norm_cell(value) -> str:
+    """表格单元格归一化：去空白，便于“营业收入 / 其中：营业收入”这类匹配。"""
+    return _CELL_WS.sub("", str(value if value is not None else ""))
+
+
+def _norm_label(value) -> str:
+    """行标签归一化：去掉“其中：/加：/减：”前缀与“（元）”这类单位后缀。"""
+    return _LABEL_UNIT.sub("", _LABEL_PREFIX.sub("", _norm_cell(value)))
+
+
+def lookup_table_value(retrieved: list[dict], row_label: str) -> list[dict]:
+    """从检索结果的 `table_json` 里按行标签精确提取整行。
+
+    这是“表格结构化为 JSON 入库”的消费端：向量检索负责找到相关表格，
+    这里直接读原始二维结构，避免让 LLM 从 Markdown 文本里重新数格子。
+    只在**首列**匹配，防止某个数值恰好等于标签造成误命中。
+    """
+    key = _norm_label(row_label)
+    if not key:
+        return []
+    rows = []
+    for item in retrieved:
+        for row in item.get("table_json") or []:
+            if not row:
+                continue
+            # 只有首列有内容的多为跨列标题（如"（一）营业收入的确认"），不是数据行
+            if not any(_norm_cell(c) for c in row[1:]):
+                continue
+            first = _norm_label(row[0])
+            if not first:
+                continue
+            # 长文本单元格不是行标签（实测有整段审计说明被当成“营业收入”行）；
+            # 允许“一、营业收入”“营业收入（元）”这类少量前后缀，但不允许整段文字。
+            if len(first) > len(key) + 8:
+                continue
+            if key == first or key in first or first in key:
+                rows.append({
+                    "chunk_id":   item.get("chunk_id", ""),
+                    "stock_code": item.get("stock_code", ""),
+                    "year":       item.get("year", ""),
+                    "page_num":   item.get("page_num", -1),
+                    "section":    item.get("section", ""),
+                    "row":        [("" if c is None else str(c)) for c in row],
+                })
+    return rows
+
+
 def build_context(retrieved: list[dict], parents: dict | None = None) -> tuple[str, list[dict]]:
     """将检索结果组装为 Prompt 上下文，返回上下文字符串和引用列表。
 
@@ -440,12 +493,17 @@ class RAGPipeline:
             if self.vec_store.meta_list else ""
         )
 
-    def query(
+    def retrieve(
         self,
         question: str,
         filter_meta: Optional[dict] = None,
         verbose: bool = False,
     ) -> dict:
+        """执行一次完整检索（改写 → 向量/BM25 → RRF → 精排）。
+
+        唯一检索入口：`query()` 与 `serve.query_debug()` 都用它，保证调试接口
+        不会因为复制了一份逻辑而和主链路越走越远。
+        """
         # ① 查询改写（可选）
         retrieval_query = rewrite_query(question, self.client) if self.use_qr else question
 
@@ -455,6 +513,7 @@ class RAGPipeline:
             logger.info(f"向量召回: {len(vec_results)} 条，最高分={vec_results[0]['vec_score']:.3f}" if vec_results else "向量召回: 0 条")
 
         # ③ BM25 + RRF 融合
+        bm25_results = []
         if self.use_bm25 and self.bm25_store:
             bm25_results = self.bm25_store.search(retrieval_query, TOP_K_RETRIEVE, filter_meta)
             candidates   = reciprocal_rank_fusion(vec_results, bm25_results)
@@ -463,7 +522,7 @@ class RAGPipeline:
         else:
             candidates = vec_results
 
-        # ④ Rerank
+        # ④ Rerank（与线上同阈值，默认不过滤）
         if self.use_rerank:
             final = rerank(question, candidates, TOP_K_RERANK, self.rerank_min_score)
         else:
@@ -471,6 +530,23 @@ class RAGPipeline:
 
         if verbose:
             logger.info(f"最终使用 {len(final)} 条上下文")
+
+        return {
+            "query":        retrieval_query,
+            "vec_results":  vec_results,
+            "bm25_results": bm25_results,
+            "candidates":   candidates,
+            "final":        final,
+        }
+
+    def query(
+        self,
+        question: str,
+        filter_meta: Optional[dict] = None,
+        verbose: bool = False,
+    ) -> dict:
+        r = self.retrieve(question, filter_meta, verbose)
+        final = r["final"]
 
         # ⑤ 相关性阈值检查
         if not final:
@@ -507,6 +583,8 @@ def main():
                         help="精排分数下限；默认不过滤。启用前先用 measure_rerank.py 重定")
     parser.add_argument("--index-dir",     type=str, default=None,
                         help="索引目录；默认 vectorstore/，可指向 vectorstore/structured")
+    parser.add_argument("--table-row",     type=str, default=None,
+                        help="不生成答案，按首列标签从检索候选的 table_json 精确取整行")
     args = parser.parse_args()
 
     pipeline = RAGPipeline(
@@ -531,6 +609,17 @@ def main():
             print("\n── 来源 ──")
             for c in result["citations"]:
                 print(f"  {c['source']}")
+
+    if args.table_row:
+        if not args.query:
+            parser.error("--table-row 需要同时提供 --query（用于定位相关表格）")
+        r = pipeline.retrieve(args.query, filter_meta=filter_meta, verbose=True)
+        rows = lookup_table_value(r["candidates"], args.table_row)
+        print(f"\n按行标签 {args.table_row!r} 命中 {len(rows)} 行")
+        for row in rows:
+            label = f"{row['stock_code']} {row['year']}年报 · {row['section']} · 第{row['page_num']}页"
+            print(f"  [{' | '.join(row['row'])}]  ← {label}")
+        return
 
     if args.query:
         result = pipeline.query(args.query, filter_meta=filter_meta, verbose=True)

@@ -116,6 +116,26 @@ class QueryResponse(BaseModel):
     answer:    str
     citations: list[Citation]
 
+class TableLookupRequest(BaseModel):
+    question:  str           = Field(..., json_schema_extra={"example": "贵州茅台2023年财务数据"})
+    row_label: str           = Field(..., json_schema_extra={"example": "营业收入"})
+    stock_code: Optional[str] = Field(None, json_schema_extra={"example": "600519"})
+    year:       Optional[str] = Field(None, json_schema_extra={"example": "2023"})
+
+class TableRow(BaseModel):
+    chunk_id:   str
+    stock_code: str
+    year:       str
+    page_num:   int
+    section:    str
+    row:        list[str]
+
+class TableLookupResponse(BaseModel):
+    question:  str
+    row_label: str
+    matched:   int
+    rows:      list[TableRow]
+
 # ── Debug 专用模型 ────────────────────────────────────────────────────────────
 
 class VecChunk(BaseModel):
@@ -216,6 +236,29 @@ def query(req: QueryRequest):
     )
 
 
+@app.post("/table/lookup", response_model=TableLookupResponse, summary="按行标签精确取表格行")
+def table_lookup(req: TableLookupRequest):
+    """在检索候选的 `table_json` 中按首列标签取整行。
+
+    与 /query 共用检索入口，但搜索的是 RRF 后的全部候选（而非精排 top-4），
+    避免精排把正确表格挤掉；命中后直接读原始二维结构，不经过 LLM。
+    """
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
+    try:
+        r = pipeline.retrieve(req.question, _filter_meta(req), verbose=False)
+        rows = _module.lookup_table_value(r["candidates"], req.row_label)
+    except Exception as e:
+        logger.error(f"Table lookup 异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    return TableLookupResponse(
+        question=req.question,
+        row_label=req.row_label,
+        matched=len(rows),
+        rows=[TableRow(**row) for row in rows],
+    )
+
+
 @app.post("/query/debug", response_model=DebugResponse, summary="调试接口：逐步返回中间结果")
 def query_debug(req: QueryRequest):
     """
@@ -230,33 +273,21 @@ def query_debug(req: QueryRequest):
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
 
-    TOP_K       = _module.TOP_K_RETRIEVE   # 10
-    TOP_K_FINAL = _module.TOP_K_RERANK     # 4
-    fm          = _filter_meta(req)
+    fm = _filter_meta(req)
 
     try:
-        # ① 向量检索
-        vec_results  = pipeline.vec_store.search(req.question, TOP_K, fm)
-        vec_rank_map = {item["chunk_id"]: rank for rank, item in enumerate(vec_results, 1)}
+        # 与 /query 共用同一个检索入口（改写→向量/BM25→RRF→精排同阈值），
+        # 调试接口不再自己复制一份逻辑。
+        r = pipeline.retrieve(req.question, fm, verbose=False)
+        vec_results  = r["vec_results"]
+        bm25_results = r["bm25_results"]
+        candidates   = r["candidates"]
+        final        = r["final"]
 
-        # ② BM25 检索：与 /query 主链路一样受 filter_meta 约束。
-        #    原注释写的是"不受 filter_meta 限制，搜全库后融合"，那是主链路修前
-        #    的真实行为；调试接口若与主链路口径不同就失去"逐步复现"的意义。
-        bm25_results  = pipeline.bm25_store.search(req.question, TOP_K, fm) if pipeline.bm25_store else []
+        vec_rank_map  = {item["chunk_id"]: rank for rank, item in enumerate(vec_results, 1)}
         bm25_rank_map = {item["chunk_id"]: rank for rank, item in enumerate(bm25_results, 1)}
 
-        # ③ RRF 融合
-        if bm25_results:
-            candidates = _module.reciprocal_rank_fusion(vec_results, bm25_results)
-        else:
-            candidates = vec_results
-
-        # ④ 与 /query 完全同口径：精排 + 同阈值 + 父块拼装
-        if pipeline.use_rerank:
-            final = _module.rerank(
-                req.question, candidates, TOP_K_FINAL, pipeline.rerank_min_score)
-        else:
-            final = candidates[:TOP_K_FINAL]
+        # 与 /query 完全同口径的父块拼装
         context, cits = _module.build_context(final, pipeline.parents)
 
         # ⑤ LLM 生成

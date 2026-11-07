@@ -496,3 +496,17 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 
 **仍需在统一重测后回填的数字**：Token 削减比例、MRR@K / Hit@K 前后差、核心财务指标
 准确率、拒答正确率、100 题基线与 structured A/B。代码完成 ≠ 简历数字成立。
+
+---
+
+## 13. P1 代码落地状态（2026-11-07）
+
+| 项 | 状态 | 结论 / 落点 |
+|---|---|---|
+| P1-1 Embedding 侧领域词表 | ⚠️ **技术上不可实现，措辞需收敛** | DashScope `text-embedding-v3` 在服务端自行 tokenize，本地 `jieba` + `src/domain_dict.txt` 只作用于 BM25。代码不做改动；简历应写"在关键词召回环节加入领域词表"，不能写"优化 embedding 分词" |
+| P1-2 `table_json` 检索期精确取数 | ✅ 已实现 | `lookup_table_value()`（只匹配首列 + 标签归一化 + 长段落伪行过滤）；CLI `--table-row`；HTTP `POST /table/lookup`，取 RRF 候选集而非精排结果 |
+| P1-3 文档口径同步 | ✅ 已更新 | README / ARCHITECTURE / USAGE_GUIDE / 面试笔记统一为：125 题 v2、四种分块、领域词表只影响 BM25、表格重复与页脚脏数据已修、当前重排结论（下限默认关闭） |
+| P1-4 调试接口口径一致 | ✅ 已实现 | `/query/debug` 改为调用 `pipeline.retrieve()` 与 `pipeline.parents`，与 `/query` 共用重排、`min_score`、top-k 和父块拼装；`tests/test_rerank.py` 三条 AST 守卫钉住接线 |
+
+P1-2 的单测 `tests/test_table_lookup.py` 9 条；`--table-row "营业收入"` 在
+structured 索引上已冒烟通过，命中合并利润表原始行。

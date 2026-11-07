@@ -151,14 +151,13 @@ def test_pipeline_call_sites_pass_filter_meta():
             isinstance(node, ast.Attribute) and node.attr == "self"
         )
 
-    fn = next(
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "query"
-        and n.args.args and n.args.args[0].arg == "self"
-    )
+    cls = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.ClassDef) and n.name == "RAGPipeline")
+    retrieve = next(n for n in cls.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "retrieve")
 
     got: dict[str, int] = {}
-    for node in ast.walk(fn):
+    for node in ast.walk(retrieve):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -173,9 +172,19 @@ def test_pipeline_call_sites_pass_filter_meta():
     assert got["vec_store"] >= 3, "向量侧调用丢了 filter_meta"
     assert got["bm25_store"] >= 3, "BM25 侧调用丢了 filter_meta —— 就是修前那个缺陷"
 
+    # query() 必须把 filter_meta 原样交给 retrieve()，否则入口处就丢了
+    query = next(n for n in cls.body
+                 if isinstance(n, ast.FunctionDef) and n.name == "query")
+    calls = [n for n in ast.walk(query)
+             if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "retrieve"]
+    assert calls, "query() 没走 retrieve()"
+    forwarded = any(any(isinstance(a, ast.Name) and a.id == "filter_meta" for a in c.args)
+                    for c in calls)
+    assert forwarded, "query() 调 retrieve() 时丢了 filter_meta"
+
 
 def test_debug_endpoint_passes_filter_meta_too():
-    """/query/debug 的 BM25 调用必须和主链路口径一致，否则"逐步复现"是假的。"""
+    """/query/debug 的检索必须和主链路口径一致，否则"逐步复现"是假的。"""
     import ast
     from pathlib import Path
 
@@ -185,15 +194,20 @@ def test_debug_endpoint_passes_filter_meta_too():
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "query_debug")
 
-    calls = [
+    # 不允许再自己复制一份检索逻辑
+    direct = [
         n for n in ast.walk(fn)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "search" and isinstance(n.func.value, ast.Attribute)
-        and n.func.value.attr == "bm25_store"
+        and n.func.attr == "search"
     ]
-    assert calls, "debug 端点里没找到 bm25_store.search 调用"
-    for c in calls:
-        assert len(c.args) + len(c.keywords) >= 3, "debug 端点的 BM25 调用丢了 filter_meta"
+    assert not direct, "debug 端点又自己调了 store.search，应该统一走 pipeline.retrieve"
+
+    calls = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "retrieve"]
+    assert calls, "debug 端点里没找到 pipeline.retrieve 调用"
+    forwarded = any(any(isinstance(a, ast.Name) and a.id == "fm" for a in c.args)
+                    for c in calls)
+    assert forwarded, "debug 端点调 retrieve() 时丢了 filter_meta"
 
 
 def test_bm25_ranking_is_deterministic_under_ties(store):

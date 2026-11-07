@@ -268,7 +268,16 @@ python src/rag_pipeline.py --query "..." --no-rerank
 # 切到 structured 索引 / 启用精排分数下限
 python src/rag_pipeline.py --query "..." --index-dir vectorstore/structured
 python src/rag_pipeline.py --query "..." --rerank-min-score 0.80
+
+# 表格精确取数：先检索相关表格，再按首列行标签取原始二维行（不经过 LLM）
+python src/rag_pipeline.py --query "贵州茅台2023年利润表" \
+    --index-dir vectorstore/structured --table-row "营业收入"
 ```
+
+`--table-row` 只在 structured 索引上有意义（表格子块的 metadata 里才有
+`table_json`）。它复用 `retrieve()` 的候选集（RRF 之后、精排之前），避免表格被
+精排挤掉；匹配时先归一化空白与 `其中：`/`（元）` 等前后缀，并且**只匹配首列**，
+命中后直接打印整行及公司、年份、章节、页码。
 
 `--rerank-min-score` 默认不设（只排序+截断，不丢上下文）。旧默认 0.70 是在
 25 题子集上选的，100 题实测 Hit@4 从 0.560 降到 0.410，已回退；启用前先用
@@ -424,6 +433,39 @@ uvicorn serve:app --host 0.0.0.0 --port 8000 --reload
   ]
 }
 ```
+
+#### `POST /table/lookup` — 表格精确取数
+
+请求体：
+```json
+{
+  "question":  "贵州茅台2023年利润表营业收入是多少",  // 用于检索相关表格
+  "row_label": "营业收入",                          // 首列行标签，支持模糊包含
+  "stock_code": "600519",                           // 可选
+  "year":       "2023"                              // 可选
+}
+```
+
+响应体：
+```json
+{
+  "question": "贵州茅台2023年利润表营业收入是多少",
+  "row_label": "营业收入",
+  "matched": 1,
+  "rows": [
+    {
+      "chunk_id": "...", "stock_code": "600519", "year": "2023",
+      "page_num": 63, "section": "财务报告 > 合并利润表",
+      "row": ["其中：营业收入", "147,693,604,994.14", "124,099,843,771.99"]
+    }
+  ]
+}
+```
+
+与 `/query` 走同一个 `pipeline.retrieve()`，但取的是 **RRF 候选集**（精排前），
+因为精排按语义相关性排序，可能把"表格行对但标题不显眼"的块挤掉。只在
+structured 索引上能取到数据；semantic 索引的 chunk 没有 `table_json`，返回
+`matched: 0`。这条路径不调用 LLM，费用只有一次 embedding 检索。
 
 #### `POST /query/debug` — 调试接口（返回检索中间结果）
 
@@ -612,4 +654,5 @@ LLM_MODEL = "deepseek-chat"
 | 05 单次问答（CLI）| 2~5 sec | ~0.002 元/次 | — |
 | serve.py 启动 | ~10 sec（一次性）| 免费 | 约 1.5 GB 内存（常驻）|
 | HTTP 单次请求 | 2~5 sec | ~0.002 元/次 | — |
-| RAGAS 评估（20题）| 30~60 min | ~5~10 元 | — |
+| RAGAS 评估（v1 20 题）| 30~60 min | ~5~10 元 | — |
+| RAGAS 评估（v2 125 题）| 按题数约为 v1 的 6 倍（未完整跑过，仅线性估算）| 同左比例 | — |

@@ -25,7 +25,7 @@
 PDF 解析（文字 + 表格 + OCR + 章节结构）
     │
     ▼ chunk_documents.py
-文档分块（三种策略可切换）
+文档分块（四种策略可切换）
     │
     ▼ build_index.py
 向量化 + 索引构建（DashScope API / 本地 BGE）
@@ -182,7 +182,8 @@ resp = client.embeddings.create(
 - 优势：语义相似，理解同义词和近义表达
 
 #### BM25 关键词检索
-- 分词：`jieba`（中文分词，默认词典）
+- 分词：`jieba` + A 股领域词表 `src/domain_dict.txt`（157 词，修正“扣非净利润”“商誉减值”等切词）
+- 注意：领域词表只作用于分词/BM25，**不影响 DashScope embedding**（模型内部自行 tokenize）
 - 打分：`BM25Okapi`（`rank_bm25` 库）
 - 优势：精确匹配数字、股票代码、专有名词（"营业收入"、"600519"）
 
@@ -198,6 +199,12 @@ score(d) = Σ 1 / (k + rank_i(d))    k = 60（经验值）
 - 对 RRF 融合后的候选集（top-10→top-20）精排，输出 top-4 给 LLM
 - 原理：双向 attention 对 (query, doc) 对打分，比 bi-encoder 更准确但不可向量化
 - 若未下载模型则自动降级为直接截断
+
+#### 表格精确取数（structured 索引）
+- 表格子块在 `metadata.table_json` 保存原始二维结构
+- 检索命中表格后，`lookup_table_value()` 按首列行标签直接取整行，
+  不经过 LLM，避免从 Markdown 里重新数格子
+- 消费端：CLI `--table-row`、HTTP `POST /table/lookup`
 
 ---
 
@@ -228,7 +235,12 @@ score(d) = Σ 1 / (k + rank_i(d))    k = 60（经验值）
 
 ## 四、评估体系
 
-### 4.1 评测题集（20 题）
+### 4.1 评测题集（v2 125 题；v1 20 题保留旧口径）
+
+v2 四类：`numeric` 36 / `multihop` 34 / `hallucination` 30 / `refusal` 25，
+由 `data/parsed` 派生并经 `verify_question_set.py` 逐字校验。
+
+v1 旧口径（ARCHITECTURE 里早期数字的来源）：
 
 | 类型 | 题数 | 考察能力 | 示例 |
 |------|------|---------|------|
@@ -280,7 +292,7 @@ rag_annual_report/
 ├── src/                         # 原生版（DashScope API）
 │   ├── download_reports.py      # 巨潮 API 下载 PDF
 │   ├── parse_pdf.py             # PDF → 结构化 JSON blocks
-│   ├── chunk_documents.py       # blocks → chunks（三种策略）
+│   ├── chunk_documents.py       # blocks → chunks（四种策略）
 │   ├── build_index.py           # chunks → FAISS 向量索引
 │   ├── rag_pipeline.py          # 问答流水线（BM25+向量+RRF+Rerank+LLM）
 │   ├── serve.py                 # FastAPI HTTP 服务

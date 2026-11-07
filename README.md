@@ -2,7 +2,7 @@
 
 > 以巨潮资讯网的 15 份 A 股年报 PDF 为语料，跑通「下载 → 解析 → 分块 → 向量化 → 检索 → 重排 → 生成 → 评估」全链路，并配套 125 题四类评测集（另保留 20 题旧口径）与消融实验。
 
-这是一个**按企业级落地标准实现的正式 RAG 项目**，语料刻意保持在最小验证规模：三种分块策略、三路检索、可开关的 Rerank 与查询改写都能用一行命令现场对比，评估脚本直接产出 RAGAS 四项指标与消融结果。小规模只为了分钟级可复现（建索引约 0.35 元、5~10 分钟），各环节的实现与取舍仍按生产标准处理。
+这是一个**按企业级落地标准实现的正式 RAG 项目**，语料刻意保持在最小验证规模：四种分块策略、三路检索、可开关的 Rerank 与查询改写都能用一行命令现场对比，评估脚本直接产出 RAGAS 四项指标与消融结果。小规模只为了分钟级可复现（建索引约 0.35 元、5~10 分钟），各环节的实现与取舍仍按生产标准处理。
 
 ## 实测规模
 
@@ -45,7 +45,7 @@ cd src && uvicorn serve:app --host 0.0.0.0 --port 8000
 # 开启重排分数下限（默认关闭，需先按 100 题重定阈值）：RERANK_MIN_SCORE=0.xx
 ```
 
-常用开关：`--stock 600519 --year 2023` 限定检索范围，`--query-rewrite` 开启查询改写，`--no-bm25` / `--no-rerank` 做消融对比，`--index-dir vectorstore/structured` 切索引。参数含义见 `src/rag_pipeline.py:498`。
+常用开关：`--stock 600519 --year 2023` 限定检索范围，`--query-rewrite` 开启查询改写，`--no-bm25` / `--no-rerank` 做消融对比，`--index-dir vectorstore/structured` 切索引，`--table-row "营业收入"` 在 structured 索引上按行标签精确取表格原始行。参数含义见 `src/rag_pipeline.py:575`。
 
 ## 技术选型一览
 
@@ -54,7 +54,7 @@ cd src && uvicorn serve:app --host 0.0.0.0 --port 8000
 | PDF 解析 | pdfplumber（表格）+ PyMuPDF（文字与字体层级）+ pytesseract（扫描件 OCR，可选）+ Qwen-VL 版式解析（可选，只走复杂页） |
 | Embedding | DashScope `text-embedding-v3`，1024 维，单批上限 10 条 |
 | 向量检索 | FAISS `IndexFlatIP`（向量已 L2 归一化，内积 = 余弦） |
-| 关键词检索 | jieba 分词 + `BM25Okapi` |
+| 关键词检索 | jieba 分词 + A 股领域词表（`src/domain_dict.txt`，只影响 BM25，不影响 DashScope embedding） + `BM25Okapi` |
 | 混合融合 | RRF（k=60） |
 | 精排 | CrossEncoder `BAAI/bge-reranker-base`（本地 1.1 GB，缺模型自动降级为截断） |
 | 生成 | DashScope `qwen-plus`，temperature 0.1 |
@@ -73,10 +73,11 @@ rag_annual_report/
 │   ├── build_index.py          # 批量 Embedding + FAISS 索引落盘（可 --out-dir 分策略存）
 │   ├── rag_pipeline.py         # 检索→重排→生成，可 import 亦可 CLI
 │   ├── refusal.py              # 拒答判定：真拒答 / 空检索 / 正常回答
-│   ├── serve.py                # FastAPI：/query、/query/debug、/health
+│   ├── serve.py                # FastAPI：/query、/table/lookup、/query/debug、/health
 │   └── static/index.html       # 展示检索中间结果的可视化页面
 ├── evaluation/
-│   ├── questions.json          # 20 题 + ground truth
+│   ├── questions.json          # v1：20 题（旧口径退路）
+│   ├── questions_v2.json       # v2：125 题四类（numeric/multihop/hallucination/refusal）
 │   ├── evaluate.py             # RAGAS 评估
 │   └── compare_strategies.py   # 分块策略 × 检索方式消融
 ├── data/          # PDF / parsed / chunks —— .gitignore，需自建

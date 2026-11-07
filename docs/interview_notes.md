@@ -51,7 +51,7 @@
 
 ---
 
-### Q4. 三种分块策略的区别与取舍
+### Q4. 四种分块策略的区别与取舍
 
 **答**（`src/chunk_documents.py`）：
 
@@ -66,6 +66,13 @@
 
 **追问：Parent-Child 的父块是怎么存的？**
 `structured` 策略已经修掉 hierarchical 的冗余设计债：父块单独写 `data/chunks/all_structured_parents.json`，建索引时拷到 `vectorstore/structured/parents.json`；子块只带 `parent_id`。检索时 `resolve_chunk_content` 按 `parent_id` 查父块表（查不到才退回内联 `parent_content` / 子块自身），即"子块召回、父块拼装"。当前主索引仍是 semantic，切 structured 用 `RAG_INDEX_DIR` 或 `--index-dir`。
+
+**追问：structured 的 `table_json` 到底解决什么问题？**
+不是"存了就算做了"。表格子块给 embedding 的是摘要文本，原始二维结构存在
+`metadata.table_json`；检索命中后 `lookup_table_value()` 按首列行标签直接取整行，
+不经过 LLM 从 Markdown 里重新数格子——数字问答的误差主要就来自这一步。入口有
+CLI `--table-row` 和 HTTP `POST /table/lookup`；匹配只认首列，先归一化空白与
+`其中：`/`（元）` 前后缀，并过滤掉首列是整段审计说明的伪数据行。
 
 **追问：分块时重叠真的有用吗？**
 在 `fixed` 里有用（切断句子时靠 overlap 补回上下文）；在 `semantic` 里没有 overlap，因为切点是语义边界。这也是为什么 `fixed` 策略下相邻块前 10 字必然相同（我用单测钉住了这个行为）。
@@ -500,13 +507,13 @@ embedding 的分词在模型内部，外部词典影响不到它。这句应该�
 | 问 | 一句话答 |
 |---|---|
 | 语料规模 | 15 份 A 股年报 PDF，5 公司 × 3 年，84.3 MB |
-| 解析块数 | 43,048 |
+| 解析块数 | 39,499（表格去重 + 页脚页码清理后；去重前 43,048） |
 | chunk 数 / 均值 | 7,931 / 526 字 |
 | 向量维度 / 模型 | 1024 / DashScope text-embedding-v3 |
 | 向量库 | FAISS 内积（向量已 L2 归一化 = 余弦），另实现 Chroma 做对比 |
-| 三种分块 | fixed / semantic（默认）/ hierarchical（父子块，Small-to-Big） |
-| 表格怎么处理 | 单独成块，不与正文合并，防 embedding 被数字稀释 |
-| 已知表格问题 | 表格内容同时进 table 和 text，约 4,491 块重复 |
+| 四种分块 | fixed / semantic（默认）/ hierarchical（父子块，Small-to-Big）/ structured（章节树 + `parents.json` + 表格 `table_json`） |
+| 表格怎么处理 | semantic 下单独成块，不与正文合并；structured 下额外保留 `table_json`，可按行标签精确取数 |
+| 已知表格问题 | ~~表格内容同时进 table 和 text，约 4,491 块重复~~ 已修（2026-11-07），块数 43,048 → 39,499 |
 | 检索召回数 | 各 10，RRF 融合后取 4 给 LLM |
 | RRF k | 60，只用排名规避量纲差异 |
 | 为什么双路 | 向量擅长语义、BM25 擅长精确数字与专名，盲区互补 |

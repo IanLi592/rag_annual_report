@@ -136,18 +136,45 @@ def test_load_failure_is_not_retried_every_request(monkeypatch):
 
 # ── 接线守卫：能力存在但没接上，等于没做（BM25 过滤那次就是这么翻车的）──
 
-def test_pipeline_query_forwards_min_score():
-    """RAGPipeline.query 必须把 self.rerank_min_score 传给 rerank()，否则新参数永远是死的。"""
+def test_pipeline_retrieve_forwards_min_score():
+    """RAGPipeline.retrieve 必须把 self.rerank_min_score 传给 rerank()，
+    否则新参数永远是死的。query / debug 都走 retrieve 这一个入口。"""
+    import ast
+    tree = ast.parse(Path(rp.__file__).read_text(encoding="utf-8"))
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "RAGPipeline")
+    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "retrieve")
+    calls = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "rerank"]
+    assert calls, "retrieve() 里没有 rerank 调用"
+    forwarded = any(any(isinstance(a, ast.Attribute) and a.attr == "rerank_min_score"
+                        for a in c.args) for c in calls)
+    assert forwarded, "rerank() 没收到 rerank_min_score —— 长尾过滤在真实链路上是死代码"
+
+
+def test_pipeline_query_uses_retrieve():
+    """query() 不能再自己复制一份检索逻辑，否则 retrieve 的守卫形同虚设。"""
     import ast
     tree = ast.parse(Path(rp.__file__).read_text(encoding="utf-8"))
     cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "RAGPipeline")
     fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "query")
-    calls = [n for n in ast.walk(fn)
-             if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "rerank"]
-    assert calls, "query() 里没有 rerank 调用"
-    forwarded = any(any(isinstance(a, ast.Attribute) and a.attr == "rerank_min_score"
-                        for a in c.args) for c in calls)
-    assert forwarded, "rerank() 没收到 rerank_min_score —— 长尾过滤在真实链路上是死代码"
+    called = {getattr(n.func, "attr", "") for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    assert "retrieve" in called, "query() 没调用 retrieve()"
+
+
+def test_debug_endpoint_uses_same_retrieval_path():
+    """/query/debug 必须走 pipeline.retrieve 与 pipeline.parents，
+    否则调试结果会和 /query 主链路越走越远。"""
+    import ast
+    import serve
+    tree = ast.parse(Path(serve.__file__).read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "query_debug")
+    calls = {getattr(n.func, "attr", "") for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    assert "retrieve" in calls, "debug 没走 pipeline.retrieve"
+    assert "build_context" in calls, "debug 没重新拼装上下文"
+    assert "rerank" not in calls, "debug 自己调了 rerank，容易与主链路分叉"
+    attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    assert "parents" in attrs, "debug 没用 pipeline.parents 拼父块"
 
 
 def test_serve_enables_rerank_with_threshold():
