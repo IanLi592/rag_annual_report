@@ -1,6 +1,9 @@
 #!/usr/bin/env sh
 # 一键跑全套。退出码取"最严重"的那个：断言失败(1) > 前置缺失(2) > 通过(0)。
-# 用法: run_all.sh [--tier p0|p0p1] [--fast-index]
+# 用法: run_all.sh [--tier p0|p0p1|eval] [--fast-index]
+#   p0    静态 + 索引
+#   p0p1  再加单测 + 服务门（默认）
+#   eval  只跑 RAGAS 基线对比（花钱档，默认 6 题冒烟）
 set -u
 CI_HOME="$(cd "$(dirname "$0")" && pwd)"; . "$CI_HOME/ci_lib.sh"
 cd "$REPO_ROOT" || exit $EXIT_PREREQ
@@ -53,6 +56,9 @@ case "$TIER" in
     run "P1-1 单测门" "$CI_HOME/check_tests.sh"
     run "P1-2 服务门" "$CI_HOME/check_service.sh"
     ;;
+esac
+case "$TIER" in
+  eval) run "RAGAS 基线对比" "$CI_HOME/check_eval_compare.sh" ;;
 esac
 T1=$(date +%s)
 

@@ -22,13 +22,19 @@ git ls-files -s scripts/git-hooks
 | 钩子 | 阶段 | 内容 | 实测耗时 |
 |---|---|---|---|
 | `pre-commit` | 提交前 | P0-1 静态门：8 文件 `py_compile` + 单进程 import 冒烟 | 见 `docs/cicd_requirements.md` §8 |
-| `pre-push` | 推送前 | P0-2 索引门（含 BM25 建库 + 真实检索）+ P1-1 单测门（35 条） | ≈ 11 s + ≈ 2 s |
+| `pre-push` | 推送前 | P0-2 索引门（含 BM25 建库 + 真实检索）+ P1-1 单测门 | ≈ 11 s + ≈ 2 s |
+| `pre-push`（条件） | 推送前 | 改动 `parse_pdf.py` / `chunk_documents.py` / `rag_pipeline.py` / 题集时，跑 RAGAS 6 题冒烟对比 | ≈ 2~4 min，报告不拦人 |
+
+RAGAS 对比门的基线是 `scripts/ci/ragas_baseline.json`。第一次跑（或主动
+`--update-baseline`）会建立基线；没有 `DASHSCOPE_API_KEY` / 裁判 key 时跳过，
+不影响推送。`CI_EVAL=0 git push` 关闭自动对比，`CI_EVAL_STRICT=1` 把指标回退当失败。
 
 服务门（P1-2，需 `DASHSCOPE_API_KEY`）不在钩子里，手动：
 
 ```sh
 sh scripts/ci/run_all.sh --tier p0p1        # 全套
 sh scripts/ci/run_all.sh --tier p0 --fast-index   # 快速自检
+sh scripts/ci/run_all.sh --tier eval        # 只跑 RAGAS 基线对比
 ```
 
 ## 逃生阀

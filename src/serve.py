@@ -242,12 +242,16 @@ def table_lookup(req: TableLookupRequest):
 
     与 /query 共用检索入口，但搜索的是 RRF 后的全部候选（而非精排 top-4），
     避免精排把正确表格挤掉；命中后直接读原始二维结构，不经过 LLM。
+    候选全落空时退回按问题推断的 stock_code/year 表格池，避免报表页因
+    数字密集在向量检索里输给叙述页。
     """
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
     try:
         r = pipeline.retrieve(req.question, _filter_meta(req), verbose=False)
-        rows = _module.lookup_table_value(r["candidates"], req.row_label)
+        rows = _module.lookup_table_value(
+            r["candidates"], req.row_label,
+            fallback_pool=pipeline.table_pool(_filter_meta(req), req.question))
     except Exception as e:
         logger.error(f"Table lookup 异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

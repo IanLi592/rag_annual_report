@@ -89,3 +89,63 @@ def test_cross_column_heading_is_not_a_row():
              ["营业收入", "100", "90"]]
     rows = rp.lookup_table_value([item(table_json=table)], "营业收入")
     assert [r["row"][0] for r in rows] == ["营业收入"]
+
+
+def test_fallback_pool_is_used_when_candidates_miss():
+    """向量检索 Top-10 里没有报表页时，按行标签扫收窄后的兜底池。
+    实测“贵州茅台2023年利润表营业收入”Top-10 全是审计意见等叙述页。"""
+    fallback = [item(chunk_id="income", table_json=TABLE)]
+    rows = rp.lookup_table_value([], "营业收入", fallback_pool=fallback)
+    assert [r["chunk_id"] for r in rows] == ["income"]
+
+
+def test_fallback_pool_is_ignored_when_candidates_hit():
+    """候选已命中就不该再扫全池，否则会混入同公司其它表的同名行。"""
+    candidates = [item(chunk_id="hit", table_json=TABLE)]
+    fallback = [item(chunk_id="other", table_json=TABLE)]
+    rows = rp.lookup_table_value(candidates, "营业收入", fallback_pool=fallback)
+    assert [r["chunk_id"] for r in rows] == ["hit"]
+
+
+def test_fallback_pool_rows_are_deduplicated():
+    table = [["营业收入", "100"], ["营业收入", "100"]]
+    rows = rp.lookup_table_value(
+        [], "营业收入", fallback_pool=[item(chunk_id="a", table_json=table)])
+    assert len(rows) == 1, "同一 chunk 的重复行只应返回一次"
+
+
+def _meta(stock, year, source, table=TABLE):
+    return item(stock_code=stock, year=year, source_file=source,
+                chunk_id=f"{stock}_{year}", table_json=table)
+
+
+def test_infer_filter_from_company_name_and_year():
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json"),
+            _meta("000858", "2023", "000858_2023_五粮液_2023年年度报告.json")]
+    filt = rp.infer_filter_from_question("贵州茅台2023年利润表营业收入", meta)
+    assert filt == {"stock_code": "600519", "year": "2023"}
+
+
+def test_infer_filter_from_stock_code():
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json")]
+    filt = rp.infer_filter_from_question("600519 2023 营业收入", meta)
+    assert filt["stock_code"] == "600519" and filt["year"] == "2023"
+
+
+def test_infer_filter_skips_ambiguous_years():
+    """跨年对比题不锁年份，否则只能查到一半。"""
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json")]
+    filt = rp.infer_filter_from_question("贵州茅台2021到2023营收趋势", meta)
+    assert filt == {"stock_code": "600519"}
+
+
+def test_infer_filter_empty_when_nothing_known():
+    assert rp.infer_filter_from_question("营业收入是多少", []) == {}
+
+
+def test_infer_filter_skips_ambiguous_companies():
+    """同时提到两家公司时不锁 stock_code，否则会拿 A 公司的数答 B 公司。"""
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json"),
+            _meta("000858", "2023", "000858_2023_五粮液_2023年年度报告.json")]
+    filt = rp.infer_filter_from_question("贵州茅台和五粮液2023年营业收入", meta)
+    assert "stock_code" not in filt and filt["year"] == "2023"

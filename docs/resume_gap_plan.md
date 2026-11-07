@@ -508,5 +508,21 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 | P1-3 文档口径同步 | ✅ 已更新 | README / ARCHITECTURE / USAGE_GUIDE / 面试笔记统一为：125 题 v2、四种分块、领域词表只影响 BM25、表格重复与页脚脏数据已修、当前重排结论（下限默认关闭） |
 | P1-4 调试接口口径一致 | ✅ 已实现 | `/query/debug` 改为调用 `pipeline.retrieve()` 与 `pipeline.parents`，与 `/query` 共用重排、`min_score`、top-k 和父块拼装；`tests/test_rerank.py` 三条 AST 守卫钉住接线 |
 
-P1-2 的单测 `tests/test_table_lookup.py` 9 条；`--table-row "营业收入"` 在
-structured 索引上已冒烟通过，命中合并利润表原始行。
+P1-2 的单测 `tests/test_table_lookup.py` 17 条；`--table-row "营业收入"` 在
+structured 索引上已冒烟通过，命中合并利润表原始行。补了兜底：候选集全落空时
+按问题推断的公司/年份在全部表格块里扫（报表页数字密集，向量 Top-10 会输给
+审计意见等叙述页），实测“贵州茅台2023年利润表营业收入”从 0 行恢复到 5 行，
+其中含第 65 页合并利润表 `一、营业收入 81,415,570,788.59`。
+
+---
+
+## 14. 简历硬伤修复（2026-11-07）
+
+| 项 | 状态 | 结果 |
+|---|---|---|
+| Parent-Child 章节树口径 | ✅ 已修 | `_update_section` 过滤目录/封面日期/公司名/TOC 点线；无“第X章”时“第X节”按 H1 处理。重新解析 15 份 PDF：主索引章节根可疑率 **63.5% → 1.5%**；structured parents **57% → 0.6%**。semantic 块内容未变，7931 条向量全部复用；structured 重分块为 6,838 chunks / 4,175 parents，重嵌 3,104 条 |
+| RAGAS 接入 CI | ✅ 已实现 | `check_eval_compare.sh` + `compare_ragas.py` + `pick_eval_ids.py`；pre-push 在改动解析/分块/Prompt/题集时自动跑 6 题冒烟对比；基线 `scripts/ci/ragas_baseline.json` 只存题号与逐题分数。默认报告不拦人，`CI_EVAL_STRICT=1` 才失败 |
+| Qwen-VL 真实页验证 | ✅ 已跑通 | 默认模型从账号不可用的 `qwen-vl-max` 改为 `qwen3-vl-plus`；茅台 2023 第 63/65 页实测每页 6 块，利润表还原为 31×4 / 27×4 `raw_table`（日志 `evaluation/results/vlm_sample_qwen3vl_20261107.log`） |
+
+**简历仍需人工修改**（代码无法代替）：领域词表改“关键词召回环节”；Token/MRR/表格 +25%
+三个数字按 §12/§13 的实测重写。

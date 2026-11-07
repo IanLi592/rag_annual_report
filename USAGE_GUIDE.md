@@ -126,14 +126,19 @@ python src/parse_pdf.py
 
 **可选：Qwen-VL 复杂页解析**（表格密集页 / 扫描页，默认关闭）：
 ```bash
-python src/parse_pdf.py --vlm-mode complex          # 只把复杂页交给 qwen-vl-max
+python src/parse_pdf.py --vlm-mode complex          # 只把复杂页交给 qwen3-vl-plus
 python src/parse_pdf.py --vlm-pages 21,22,23        # 只解析指定页（1-based）
 python src/parse_pdf.py --vlm-sample 5              # 每份 PDF 抽样 5 张复杂页做验证
 python src/parse_pdf.py --vlm-mode all --vlm-max-pages 10   # 全页模式 + 硬预算
 ```
 - 需要 `DASHSCOPE_API_KEY`；没有 key 或调用失败时**逐页回退规则解析**，不会中断整份年报
 - 结果缓存在 `data/vlm_cache/<pdf名>/page_XXXX.json`，重跑不重复计费
-- 环境变量：`VLM_MODE=off|complex|all`、`VLM_MAX_PAGES=60`、`VLM_DPI=150`、`VLM_MODEL=qwen-vl-max`
+- 环境变量：`VLM_MODE=off|complex|all`、`VLM_MAX_PAGES=60`、`VLM_DPI=150`、`VLM_MODEL=qwen3-vl-plus`
+
+实测（2026-11-07，茅台 2023 第 63/65 页）：`qwen3-vl-plus` 每页返回 6 个块，
+两张利润表分别还原为 31×4、27×4 的 `raw_table`。默认模型已从不可用的
+`qwen-vl-max` 改为账号实际可用的 `qwen3-vl-plus`；若你的账号只有旧模型，
+用 `VLM_MODEL=` 覆盖即可。
 
 **预期输出**：
 ```
@@ -278,6 +283,12 @@ python src/rag_pipeline.py --query "贵州茅台2023年利润表" \
 `table_json`）。它复用 `retrieve()` 的候选集（RRF 之后、精排之前），避免表格被
 精排挤掉；匹配时先归一化空白与 `其中：`/`（元）` 等前后缀，并且**只匹配首列**，
 命中后直接打印整行及公司、年份、章节、页码。
+
+候选集里一行都没命中时，会按问题推断公司与年份，在**收窄后的全部表格块**里再扫
+一遍（`rag_pipeline.table_pool`）。报表页以数字为主，向量相似度经常输给审计意见
+这类叙述页——实测 `贵州茅台2023年利润表营业收入` 的 Top-10 里没有合并利润表，
+但兜底扫描能精确命中。推断不出公司（如问题同时提到多家公司）时不扫全库，
+避免跨公司串数；此时与旧行为一致，只返回候选集里的命中。
 
 `--rerank-min-score` 默认不设（只排序+截断，不丢上下文）。旧默认 0.70 是在
 25 题子集上选的，100 题实测 Hit@4 从 0.560 降到 0.410，已回退；启用前先用
@@ -565,7 +576,31 @@ RAGAS 评估结果 - native
 
 结果保存到 `evaluation/results/native_20260416_210000.json` 和对应 CSV。
 
-### 5.2 消融实验
+### 5.2 RAGAS 基线对比门（CI）
+
+`scripts/ci/check_eval_compare.sh` 把“这次跑分”和 `scripts/ci/ragas_baseline.json`
+按同一批题号对比，输出四项指标 diff 与逐题回退：
+
+```bash
+# 默认：按 v2 类别分层抽 2 题/类（共 6 题），没有基线时自动建立
+sh scripts/ci/check_eval_compare.sh
+
+# 重建基线（例如主动改了 Prompt/分块，认为新结果才是新基线）
+sh scripts/ci/check_eval_compare.sh --update-baseline --per-category 2
+
+# 指标回退超过 3pp 时退出码 1（默认只报告，不拦人）
+sh scripts/ci/check_eval_compare.sh --strict
+
+# 全量 125 题（30~60 分钟，花钱档）
+python evaluation/evaluate.py --question-set v2
+```
+
+pre-push 钩子只在本次推送改到 `parse_pdf.py` / `chunk_documents.py` /
+`rag_pipeline.py` / 题集时触发 6 题冒烟对比；`CI_EVAL=0 git push` 可关闭，
+`CI_EVAL_STRICT=1 git push` 把指标回退当失败。基线只保存题号与逐题 RAGAS 分数，
+不存答案和上下文。
+
+### 5.3 消融实验
 
 需要先分别构建三套向量索引（修改 `chunk_documents.py` 中的 `STRATEGY` 变量分别运行三次 chunk_documents + build_index）：
 

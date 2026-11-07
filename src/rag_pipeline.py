@@ -93,6 +93,39 @@ def match_filter(item: dict, filter_meta: Optional[dict]) -> bool:
     return all(str(item.get(k, "")) == str(v) for k, v in filter_meta.items())
 
 
+def infer_filter_from_question(question: str, meta_list: list[dict]) -> dict:
+    """从问题文本里推断 stock_code / year，用于表格精确取数的兜底。
+
+    只做**高置信**推断：问题里出现完整股票代码、年报里的公司全称，或唯一的
+    四位年份。推断不出来的维度不填，绝不猜。
+    """
+    filt: dict[str, str] = {}
+
+    codes = {
+        str(item.get("stock_code", ""))
+        for item in meta_list
+        if item.get("stock_code") and str(item["stock_code"]) in question
+    }
+    if len(codes) == 1:
+        filt["stock_code"] = codes.pop()
+    elif not codes:
+        # 公司名取自 source_file 的第三段（600519_2023_贵州茅台_...）
+        name_to_code: dict[str, str] = {}
+        for item in meta_list:
+            parts = Path(str(item.get("source_file", ""))).stem.split("_")
+            if len(parts) >= 3 and parts[2]:
+                name_to_code.setdefault(parts[2], str(item.get("stock_code", "")))
+        matched = {code for name, code in name_to_code.items() if name in question}
+        if len(matched) == 1:
+            filt["stock_code"] = matched.pop()
+        # 问题里同时提到多家公司时不锁公司 —— 锁哪家都可能答错
+
+    years = sorted(set(re.findall(r"(?<!\d)(20\d{2})(?!\d)", question)))
+    if len(years) == 1:
+        filt["year"] = years[0]
+    return filt
+
+
 class VectorStore:
     def __init__(self, client: OpenAI, index_dir: str | Path | None = None):
         import faiss
@@ -370,18 +403,10 @@ def _norm_label(value) -> str:
     return _LABEL_UNIT.sub("", _LABEL_PREFIX.sub("", _norm_cell(value)))
 
 
-def lookup_table_value(retrieved: list[dict], row_label: str) -> list[dict]:
-    """从检索结果的 `table_json` 里按行标签精确提取整行。
-
-    这是“表格结构化为 JSON 入库”的消费端：向量检索负责找到相关表格，
-    这里直接读原始二维结构，避免让 LLM 从 Markdown 文本里重新数格子。
-    只在**首列**匹配，防止某个数值恰好等于标签造成误命中。
-    """
-    key = _norm_label(row_label)
-    if not key:
-        return []
+def _collect_table_rows(items: list[dict], key: str) -> list[dict]:
+    """按归一化行标签扫描 `table_json`，只认首列。"""
     rows = []
-    for item in retrieved:
+    for item in items:
         for row in item.get("table_json") or []:
             if not row:
                 continue
@@ -404,6 +429,38 @@ def lookup_table_value(retrieved: list[dict], row_label: str) -> list[dict]:
                     "section":    item.get("section", ""),
                     "row":        [("" if c is None else str(c)) for c in row],
                 })
+    return rows
+
+
+def lookup_table_value(
+    retrieved: list[dict],
+    row_label: str,
+    fallback_pool: Optional[list[dict]] = None,
+) -> list[dict]:
+    """从检索结果的 `table_json` 里按行标签精确提取整行。
+
+    这是“表格结构化为 JSON 入库”的消费端：向量检索负责找到相关表格，
+    这里直接读原始二维结构，避免让 LLM 从 Markdown 文本里重新数格子。
+    只在**首列**匹配，防止某个数值恰好等于标签造成误命中。
+
+    `fallback_pool`：检索候选里没有命中时的兜底池（按 stock_code/year 收窄的
+    全部表格块）。报表页的 chunk 以大段数字为主，向量相似度经常输给审计意见
+    之类的叙述页 —— 实测“贵州茅台2023年利润表营业收入”的 Top-10 里没有
+    合并利润表，但按行标签直接在 600519/2023 的表格块里扫就能精确命中。
+    """
+    key = _norm_label(row_label)
+    if not key:
+        return []
+    rows = _collect_table_rows(retrieved, key)
+    if rows or not fallback_pool:
+        return rows
+
+    seen = set()
+    for r in _collect_table_rows(fallback_pool, key):
+        sig = (r["chunk_id"], tuple(r["row"]))
+        if sig not in seen:
+            seen.add(sig)
+            rows.append(r)
     return rows
 
 
@@ -492,6 +549,25 @@ class RAGPipeline:
             self.vec_store.meta_list[0].get("strategy", "")
             if self.vec_store.meta_list else ""
         )
+
+    def table_pool(
+        self,
+        filter_meta: Optional[dict] = None,
+        question: str = "",
+    ) -> list[dict]:
+        """表格精确取数的兜底池：收窄到 stock_code/year 后的全部表格块。
+
+        必须有 stock_code 才返回 —— 15 份年报都有“营业收入”，只按年份或全库
+        扫会跨公司串数，宁可返回空也不返回错公司的数。
+        """
+        filt = dict(filter_meta or {})
+        for k, v in infer_filter_from_question(
+                question, self.vec_store.meta_list).items():
+            filt.setdefault(k, v)
+        if not filt.get("stock_code"):
+            return []
+        return [item for item in self.vec_store.meta_list
+                if item.get("table_json") and match_filter(item, filt)]
 
     def retrieve(
         self,
@@ -614,7 +690,9 @@ def main():
         if not args.query:
             parser.error("--table-row 需要同时提供 --query（用于定位相关表格）")
         r = pipeline.retrieve(args.query, filter_meta=filter_meta, verbose=True)
-        rows = lookup_table_value(r["candidates"], args.table_row)
+        rows = lookup_table_value(
+            r["candidates"], args.table_row,
+            fallback_pool=pipeline.table_pool(filter_meta, args.query))
         print(f"\n按行标签 {args.table_row!r} 命中 {len(rows)} 行")
         for row in rows:
             label = f"{row['stock_code']} {row['year']}年报 · {row['section']} · 第{row['page_num']}页"

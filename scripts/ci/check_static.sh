@@ -11,7 +11,7 @@ ensure_results_dir
 FAILED=""
 
 # ① py_compile —— 抓 SyntaxError / 缩进错 / 模板字符串提前终止这类
-for f in src/*.py evaluation/*.py; do
+for f in src/*.py evaluation/*.py scripts/ci/*.py; do
   [ -f "$f" ] || continue
   if ! "$CI_PY" -m py_compile "$f" 2>/dev/null; then
     FAILED="$FAILED $f"

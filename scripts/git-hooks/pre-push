@@ -1,12 +1,37 @@
 #!/usr/bin/env sh
 # P0-2 + P1-1 推送前拦截：索引一致性（含 BM25 真实检索）+ 纯函数单测。
 # 服务门 P1-2 不在这里跑（要密钥、要冷启动 12s+），走 run_all.sh。
+#
+# RAGAS 对比门：只有本次推送改到“会影响检索/生成口径”的文件时才跑。
+# 默认 6 题冒烟（按类别分层），不是全量 125 题 —— 见 check_eval_compare.sh。
+# 关掉：CI_EVAL=0 git push；严格拦截：CI_EVAL_STRICT=1 git push。
 set -u
 CI_HOME="$(cd "$(dirname "$0")/../ci" && pwd)"
 . "$CI_HOME/ci_lib.sh"
 
-# git 会往 stdin 灌待推的 ref 列表，读干净免得管道报错
-while read -r _lr _ls _rr _rs; do :; done
+# git 会往 stdin 灌待推的 ref 列表；顺手收集改动文件，供 RAGAS 触发判断。
+RELEVANT=0
+CHANGED=""
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
+  if [ "${remote_sha:-}" = "0000000000000000000000000000000000000000" ]; then
+    base="$(git rev-list --max-parents=0 "$local_sha" 2>/dev/null | head -1)"
+    [ -n "$base" ] || continue
+    files="$(git diff --name-only "$base" "$local_sha" 2>/dev/null)"
+  else
+    files="$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null)"
+  fi
+  CHANGED="$CHANGED $files"
+done
+
+for f in $CHANGED; do
+  case "$f" in
+    src/chunk_documents.py|src/rag_pipeline.py|src/parse_pdf.py|\
+    src/build_index.py|evaluation/questions.json|evaluation/questions_v2.json)
+      RELEVANT=1 ;;
+  esac
+done
 
 if ci_skip_requested; then
   ci_note "=============================================="
@@ -23,5 +48,21 @@ worst=$EXIT_PASS
 "$CI_HOME/check_tests.sh"; rc=$?
 [ "$rc" -eq "$EXIT_ASSERT" ] && worst=$EXIT_ASSERT
 [ "$rc" -eq "$EXIT_PREREQ" ] && [ "$worst" -ne "$EXIT_ASSERT" ] && worst=$EXIT_PREREQ
+
+if [ "$RELEVANT" -eq 1 ]; then
+  if [ "${CI_EVAL:-1}" = "0" ]; then
+    ci_note "改到了检索/分块/题集，但 CI_EVAL=0 —— 跳过 RAGAS 对比"
+  else
+    ci_note "改到了检索/分块/题集，跑 RAGAS 冒烟对比（默认 6 题）"
+    "$CI_HOME/check_eval_compare.sh"
+    rc=$?
+    # 默认报告不拦人；CI_EVAL_STRICT=1 时把回退当失败
+    if [ "${CI_EVAL_STRICT:-0}" = "1" ] && [ "$rc" -eq "$EXIT_ASSERT" ]; then
+      worst=$EXIT_ASSERT
+    elif [ "$rc" -eq "$EXIT_PREREQ" ]; then
+      ci_note "RAGAS 对比因前置缺失跳过（不影响本次推送）"
+    fi
+  fi
+fi
 
 exit $worst

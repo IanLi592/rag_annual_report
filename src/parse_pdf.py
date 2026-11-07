@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # VLM 分支：默认关闭，只有显式 --vlm-mode / VLM_MODE 才启用。
 # 页类型判断、prompt、响应解析都在 parse_pdf_vlm，这里只负责路由与回退。
-from parse_pdf_vlm import VlmConfig, get_vlm_client, is_complex_page, parse_page_vlm
+from parse_pdf_vlm import VlmConfig, get_vlm_client, is_complex_page, parse_page_vlm, cache_namespace
 
 RAW_DIR    = Path(__file__).parent.parent / "data" / "raw_pdf"
 PARSED_DIR = Path(__file__).parent.parent / "data" / "parsed"
@@ -131,6 +131,48 @@ def classify_heading(title: str, fontsize: Optional[float] = None, is_bold: bool
     return 0
 
 
+# ── 章节栈的噪声过滤 ─────────────────────────────────────────────────────────
+# 这些“标题”会被字体/加粗规则误判，且一旦进入 section_path 就会长期留在栈顶：
+#   · 目录页的“目录” / “第一节 ……… 3”（点线）
+#   · 封面公司名、落款日期
+# 实测未过滤时，主索引 63.5% 的 chunk 章节根是“目录/公司名/日期”，
+# structured 的 parents.json 有 57% 同样被污染。
+_TOC_TITLE_RE    = re.compile(r"^目\s*录$")
+_TOC_LEADER_RE   = re.compile(r"\.{6,}")
+_DATE_TITLE_RE   = re.compile(
+    r"^[\d〇○零一二三四五六七八九十]{2,4}年"
+    r"[\d〇○零一二三四五六七八九十]{1,2}月"
+    r"[\d〇○零一二三四五六七八九十]{1,2}日$")
+_COMPANY_TITLE_RE = re.compile(r"^.{2,30}(?:股份有限公司|有限责任公司|有限公司)$")
+_CHAPTER_RE      = re.compile(r"^第[一二三四五六七八九十百]+章")
+_SECTION_RE      = re.compile(r"^第[一二三四五六七八九十百]+节")
+
+
+def is_non_section_title(title: str) -> bool:
+    """标题出现在版面上，但不应该进入章节路径（目录/封面色/落款）。"""
+    t = title.strip()
+    return bool(
+        _TOC_TITLE_RE.fullmatch(t)
+        or _DATE_TITLE_RE.fullmatch(t)
+        or _COMPANY_TITLE_RE.fullmatch(t)
+        or _TOC_LEADER_RE.search(t)
+    )
+
+
+def is_chapter_title(title: str) -> bool:
+    return bool(_CHAPTER_RE.match(title.strip()))
+
+
+def is_section_title(title: str) -> bool:
+    return bool(_SECTION_RE.match(title.strip()))
+
+
+def is_toc_page(lines: list[str]) -> bool:
+    """目录页：至少两行带点线。命中后整页标题都不推进章节栈。"""
+    return sum(1 for line in lines if _TOC_LEADER_RE.search(line)) >= 2
+
+
+
 def table_to_markdown(table: list[list]) -> str:
     """把 pdfplumber 提取的表格转成 markdown 格式，方便 LLM 理解。"""
     if not table:
@@ -209,9 +251,26 @@ class AnnualReportParser:
         self._vlm_sample_seen = 0
         self._vlm_budget_warned = False
 
+    def _section_level(self, title: str, level: int = 0) -> int:
+        """把标题落到有效的 H1/H2/H3；目录/封面噪声返回 0。
+
+        年报有两种编号习惯：有的用“第X章”做一级、第X节做二级；有的直接
+        用“第X节”做一级。后者如果按 H2 处理，会把栈顶的“目录/公司名”
+        一直当成父级。这里显式区分：栈顶是第X章时第X节才是 H2，否则是 H1。
+        """
+        if is_non_section_title(title):
+            return 0
+        if is_section_title(title):
+            if self._section_stack and is_chapter_title(self._section_stack[0]):
+                return 2
+            return 1
+        return level or classify_heading(title)
+
     def _update_section(self, title: str, level: int = 0):
         """维护章节栈：根据编号层级推断层次，并显式记录 H1/H2/H3。"""
-        level = level or classify_heading(title)
+        level = self._section_level(title, level)
+        if level <= 0:
+            return
         if level == 1 or not self._section_stack:
             self._section_stack = [title]                              # H1
             self._section_levels = [1]
@@ -225,6 +284,7 @@ class AnnualReportParser:
             # 没有编号规律的标题保留旧行为：最多保留三级 + 当前标题
             self._section_stack = self._section_stack[:3] + [title]
             self._section_levels = self._section_levels[:3] + [3]
+
 
     def _should_use_vlm(self, page_num: int, raw_text: str, plumb_page, fitz_page) -> bool:
         cfg = self.vlm_config
@@ -256,7 +316,8 @@ class AnnualReportParser:
                 self._vlm_budget_warned = True
             return None
 
-        cache_path = cfg.cache_dir / self.pdf_path.stem / f"page_{page_num + 1:04d}.json"
+        cache_path = (cfg.cache_dir / cache_namespace()
+                      / self.pdf_path.stem / f"page_{page_num + 1:04d}.json")
         if cache_path.exists():
             try:
                 data = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -335,6 +396,13 @@ class AnnualReportParser:
         # 落在表格 bbox 内，全量约 4,491 个块是这种重复（README 记为已知问题）。
         page_dict = fitz_page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
         current_para_lines = []
+        page_lines = [
+            "".join(span["text"] for span in line.get("spans", [])).strip()
+            for block in page_dict.get("blocks", [])
+            if block.get("type") == 0
+            for line in block.get("lines", [])
+        ]
+        in_toc_page = is_toc_page(page_lines)
 
         def _in_table(bbox) -> bool:
             if not bbox or not table_bboxes:
@@ -373,8 +441,14 @@ class AnnualReportParser:
                         ))
                         current_para_lines = []
 
-                    level = classify_heading(line_text, fontsize, is_bold)
-                    self._update_section(line_text, level)
+                    if in_toc_page:
+                        # 目录页的条目不是真实章节：保留 title 块供分块切边界，
+                        # 但不推进章节栈，heading_level 记 0。
+                        level = 0
+                    else:
+                        level = self._section_level(
+                            line_text, classify_heading(line_text, fontsize, is_bold))
+                        self._update_section(line_text, level)
                     self.blocks.append(ParsedBlock(
                         block_type="title",
                         content=line_text,
@@ -415,6 +489,12 @@ class AnnualReportParser:
                     # 必须知道这一页新出现的标题，否则 section_path 会停在旧章节。
                     for b in vlm_blocks:
                         if b.block_type == "title":
+                            # VLM 没有字体/加粗信息，不能信它给的无编号标题 H1：
+                            # 实测 qwen3-vl-plus 会把“合并利润表”标成 heading_level=1，
+                            # 一旦当 H1 就会把“第十节 财务报告”顶掉。这里只认编号规律，
+                            # 无编号标题（报表名等）不准推进章节栈。
+                            b.heading_level = self._section_level(
+                                b.content, classify_heading(b.content))
                             self._update_section(b.content, b.heading_level)
                         b.section_path = list(self._section_stack)
                     self.blocks.extend(vlm_blocks)

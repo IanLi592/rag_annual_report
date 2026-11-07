@@ -120,6 +120,8 @@ chunk_size=500字符，overlap=50字符
   `parent_id` 查 `parents.json`，查不到再退回内联 `parent_content` / 子块自身
 - 落盘到 `vectorstore/structured/`，通过 `RAG_INDEX_DIR` 或 `--index-dir` 切换；
   **不设为默认**——100 题实测混合检索上弱于 semantic（见 `docs/resume_gap_plan.md` §11）
+- 章节栈修复后（2026-11-07）重新分块：6,838 个 chunks / 4,175 个 parents；
+  章节根被“目录/公司名/日期”污染的比例从 57% 降到 0.6%（指标待重测）
 
 **实际产出**（语义分块）：7,931 个 chunks，平均 526 字符（2026-11-07 解析去重后；去重前 10,352）
 
@@ -204,6 +206,9 @@ score(d) = Σ 1 / (k + rank_i(d))    k = 60（经验值）
 - 表格子块在 `metadata.table_json` 保存原始二维结构
 - 检索命中表格后，`lookup_table_value()` 按首列行标签直接取整行，
   不经过 LLM，避免从 Markdown 里重新数格子
+- 候选集全落空时，按问题推断的 `stock_code`/`year` 在全部表格块里兜底扫描
+  （报表页数字密集，向量相似度常输给审计意见等叙述页）；推断不出公司则不扫，
+  防止跨公司串数
 - 消费端：CLI `--table-row`、HTTP `POST /table/lookup`
 
 ---
@@ -261,6 +266,12 @@ v1 旧口径（ARCHITECTURE 里早期数字的来源）：
 
 评估中 LLM 裁判默认使用**小米 MiMo Token Plan**（`mimo-v2.6-flash` @ `https://token-plan-cn.xiaomimimo.com/v1`，需 `MIMO_API_KEY`；预设见 `evaluation/evaluate.py` 的 `JUDGE_PRESETS`），Embedding 使用 DashScope `text-embedding-v3`，两者都走 OpenAI 兼容接口，无需 OpenAI key。设 `RAGAS_LLM_PROVIDER=deepseek` 可切回原先的 `deepseek-v4-flash` 裁判 —— 本文下列指标数字最初是在 DeepSeek 裁判上得到的，换裁判等于换尺子，归因时要先确认档位。
 
+**RAGAS 基线对比门**：`scripts/ci/check_eval_compare.sh` 用固定题号重跑评估，与
+`scripts/ci/ragas_baseline.json` 比四项指标并输出逐题回退；pre-push 在改动
+`parse_pdf.py` / `chunk_documents.py` / `rag_pipeline.py` / 题集时自动触发 6 题冒烟。
+默认只报告不拦人（`CI_EVAL_STRICT=1` 才以回退为失败），因为 6 题上的 RAGAS 抖动大；
+完整口径仍用 `python evaluation/evaluate.py --question-set v2`。
+
 ### 4.3 消融实验矩阵
 
 ```
@@ -268,6 +279,8 @@ v1 旧口径（ARCHITECTURE 里早期数字的来源）：
   策略: fixed / semantic / hierarchical
   检索: vector_only / bm25_only / hybrid
 ```
+> structured 走独立的数值题 A/B（`scripts/ci/measure_index_ab.py`），
+> 目录布局与 `compare_strategies.py` 的 `vectorstore/faiss_{strategy}/` 约定不同，未并入此矩阵。
 
 指标：`Hit Rate @4`（命中率）和 `MRR`（平均倒数排名），不依赖 LLM，运行快。
 
@@ -299,9 +312,13 @@ rag_annual_report/
 │   └── static/index.html        # 检索链路可视化 Web 页面
 │
 ├── evaluation/
-│   ├── questions.json           # 20 道标准测试题 + ground truth
+│   ├── questions.json           # v1：20 题（旧口径）
+│   ├── questions_v2.json        # v2：125 题四类
 │   ├── evaluate.py              # RAGAS 四项指标自动评估
 │   └── compare_strategies.py    # 消融实验（策略 × 检索方式）
+│
+├── scripts/ci/                  # 本地 CI（静态/索引/单测/服务/RAGAS 对比）
+│   └── ragas_baseline.json      # RAGAS 6 题冒烟基线（题号 + 逐题分数）
 │
 ├── requirements.txt
 ├── ARCHITECTURE.md              # 本文档

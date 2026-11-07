@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ import pymupdf
 logger = logging.getLogger(__name__)
 
 DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-VLM_MODEL = os.getenv("VLM_MODEL", "qwen-vl-max")
+VLM_MODEL = os.getenv("VLM_MODEL", "qwen3-vl-plus")
 VLM_DPI = int(os.getenv("VLM_DPI", "150"))
 VLM_MAX_PAGES = int(os.getenv("VLM_MAX_PAGES", "60"))
 VLM_CACHE_DIR = Path(os.getenv("VLM_CACHE_DIR", str(Path(__file__).parent.parent / "data" / "vlm_cache")))
@@ -63,6 +64,17 @@ class VlmConfig:
             raise ValueError(f"VLM_MODE 必须是 off/complex/all，收到 {self.mode!r}")
         if self.max_pages < 0:
             raise ValueError("VLM_MAX_PAGES 不能为负")
+
+
+def cache_namespace() -> str:
+    """缓存目录按“模型 + prompt 版本”隔离。
+
+    旧实现只按 PDF/页码缓存：换 VLM_MODEL 或改 prompt 后会命中旧结果，
+    看似省钱，实际是在拿旧模型输出冒充新配置（实测换模型时踩过）。
+    """
+    safe_model = re.sub(r"[^A-Za-z0-9_.-]", "_", VLM_MODEL)
+    digest = hashlib.sha1(VLM_PROMPT.encode("utf-8")).hexdigest()[:8]
+    return f"{safe_model}-{digest}"
 
 
 def is_complex_page(plumb_page, fitz_page, text: str) -> bool:
@@ -131,7 +143,9 @@ VLM_PROMPT = """你是中国上市公司年报的版式解析器。请只解析�
 1. 标题按章节层级给 heading_level：第X章=1，第X节=2，一、/1.=3，其他=0。
 2. 表格必须保留行列结构，放在 table.header / table.rows；content 写一句简短摘要。
 3. 不要合并跨栏，不要把表格拍平成一段文字。
-4. 无法识别的页返回 []。
+4. 报表名（如“合并利润表”“母公司资产负债表”）heading_level 一律给 0，
+   它们不是章节标题；只有“第X章/第X节/一、/1.”才给 1/2/3。
+5. 无法识别的页返回 []。
 只输出 JSON 数组。"""
 
 

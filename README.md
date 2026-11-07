@@ -47,6 +47,18 @@ cd src && uvicorn serve:app --host 0.0.0.0 --port 8000
 
 常用开关：`--stock 600519 --year 2023` 限定检索范围，`--query-rewrite` 开启查询改写，`--no-bm25` / `--no-rerank` 做消融对比，`--index-dir vectorstore/structured` 切索引，`--table-row "营业收入"` 在 structured 索引上按行标签精确取表格原始行。参数含义见 `src/rag_pipeline.py:575`。
 
+## 本地 CI
+
+```bash
+sh scripts/ci/run_all.sh --tier p0p1   # 静态 + 索引 + 单测 + 服务门
+sh scripts/ci/run_all.sh --tier eval   # RAGAS 基线对比（默认 6 题冒烟，花钱档）
+```
+
+pre-commit 跑静态门；pre-push 跑索引门与单测门。若本次推送改到
+`parse_pdf.py` / `chunk_documents.py` / `rag_pipeline.py` / 题集，会自动追加一次
+RAGAS 6 题对比，输出四项指标 diff 与逐题回退（`CI_EVAL=0` 可关闭）。
+基线在 `scripts/ci/ragas_baseline.json`，只存题号与逐题分数。
+
 ## 技术选型一览
 
 | 环节 | 选型 |
