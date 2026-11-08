@@ -45,7 +45,7 @@ cd src && uvicorn serve:app --host 0.0.0.0 --port 8000
 # 开启重排分数下限（默认关闭，需先按 100 题重定阈值）：RERANK_MIN_SCORE=0.xx
 ```
 
-常用开关：`--stock 600519 --year 2023` 限定检索范围，`--query-rewrite` 开启查询改写，`--no-bm25` / `--no-rerank` 做消融对比，`--index-dir vectorstore/structured` 切索引，`--table-row "营业收入"` 在 structured 索引上按行标签精确取表格原始行。参数含义见 `src/rag_pipeline.py:575`。
+常用开关：`--stock 600519 --year 2023` 限定检索范围，`--query-rewrite` 开启查询改写，`--no-bm25` / `--no-rerank` 做消融对比，`--index-dir vectorstore/structured` 切索引，`--table-row "营业收入"` 按行标签精确取表格原始行（默认 semantic 与 structured 索引都支持）。参数含义见 `src/rag_pipeline.py:834`。
 
 ## 本地 CI
 

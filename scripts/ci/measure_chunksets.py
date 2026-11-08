@@ -65,7 +65,8 @@ def _one_pass(set_name: str, emit: str) -> int:
           if q.get("target_docs")]
     hits, mrrs = [], []
     for q in qs:
-        sel = store.search(q["question"], 8)[:4]
+        qtext = rp.expand_query_entities(q["question"], store.meta_list)
+        sel = store.search(qtext, 8)[:4]
         pos = None
         for i, it in enumerate(sel, 1):
             k = f"{it['stock_code']}_{it['year']}"

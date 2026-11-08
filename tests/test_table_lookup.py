@@ -149,3 +149,59 @@ def test_infer_filter_skips_ambiguous_companies():
             _meta("000858", "2023", "000858_2023_五粮液_2023年年度报告.json")]
     filt = rp.infer_filter_from_question("贵州茅台和五粮液2023年营业收入", meta)
     assert "stock_code" not in filt and filt["year"] == "2023"
+
+
+def _pipe(meta):
+    pipe = object.__new__(rp.RAGPipeline)
+    pipe.vec_store = type("V", (), {"meta_list": meta})()
+    return pipe
+
+
+def test_query_table_context_extracts_named_row():
+    """自然语言问题里点名的指标，应补成一条可引用的上下文。"""
+    table = [["项目", "2023年"], ["总资产", "1,000"], ["资产", "2,000"]]
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json",
+                  table=table)]
+    items = _pipe(meta)._table_context_items("贵州茅台2023年的总资产是多少")
+    assert len(items) == 1
+    assert "总资产" in items[0]["content"]
+    assert "1,000" in items[0]["content"]
+    assert "2,000" not in items[0]["content"], "不应退到子串“资产”"
+
+
+def test_query_table_context_requires_company():
+    """没有公司线索时不取数，避免跨公司串数。"""
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json")]
+    assert _pipe(meta)._table_context_items("2023年的总资产是多少") == []
+
+
+def test_query_table_context_empty_when_no_label_in_question():
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json")]
+    assert _pipe(meta)._table_context_items("贵州茅台2023年的经营情况如何") == []
+
+
+def test_query_table_context_maps_metric_synonym():
+    """2022 年报首列写“资产总计”，问题问“总资产”，应能对上。"""
+    table = [["项目", "2022年"], ["资产总计", "152,714,727,880.22"]]
+    meta = [_meta("000858", "2022", "000858_2022_五粮液_2022年年度报告.json",
+                  table=table)]
+    items = _pipe(meta)._table_context_items("五粮液2022年的总资产是多少？")
+    assert len(items) == 1
+    assert "资产总计" in items[0]["content"]
+    assert "152,714,727,880.22" in items[0]["content"]
+
+
+def test_query_table_context_skips_rows_without_level_value():
+    """只有占比/增减列时不补位：空内容会挤掉原本有效的上下文。"""
+    table = [["项目", "占营业收入比例"], ["研发费用", "5.2%"]]
+    meta = [_meta("600519", "2023", "600519_2023_贵州茅台_2023年年度报告.json",
+                  table=table)]
+    assert _pipe(meta)._table_context_items("贵州茅台2023年研发费用占比是多少") == []
+
+
+def test_chinese_ordinal_prefix_is_normalized():
+    """利润表行常写成“一、营业收入”，问题只写“营业收入”也应能取到。"""
+    table = [["项目", "2023年"], ["一、营业收入", "100"]]
+    rows = rp.lookup_table_value([item(table_json=table)], "营业收入")
+    assert len(rows) == 1
+    assert rows[0]["row"][0] == "一、营业收入"

@@ -90,6 +90,15 @@ def test_semantic_is_ocr_propagates_as_any():
     assert out[0]["metadata"]["is_ocr"] is True
 
 
+def test_semantic_table_chunk_keeps_raw_table_json():
+    """默认 semantic 索引也要保留二维表，否则 /table/lookup 必须先切 structured。"""
+    table = blk("table", "| 项目 | 2023年 |", page=7)
+    table["raw_table"] = [["项目", "2023年"], ["营业收入", "100"]]
+    out = list(cd.chunk_semantic([table]))
+    assert out[0]["metadata"]["table_json"] == [["项目", "2023年"], ["营业收入", "100"]]
+    assert out[0]["metadata"]["parent_id"] == ""
+
+
 # ── 策略 C：层级分块 ──────────────────────────────────────────────────────────
 
 def test_hierarchical_children_carry_parent_id_and_parent_content():

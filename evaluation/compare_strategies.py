@@ -208,17 +208,22 @@ def compute_metrics(
     hits = []
     mrrs = []
 
+    if str(BASE_DIR / "src") not in sys.path:
+        sys.path.insert(0, str(BASE_DIR / "src"))
+    from rag_pipeline import expand_query_entities
+
     for q in questions:
         target_docs = q.get("target_docs", [])
         if not target_docs:
             continue  # should_refuse 类跳过
 
+        qtext = expand_query_entities(q["question"], meta_list)
         if retrieval_mode == "vector_only":
-            retrieved = retrieve_vector(q["question"], index, meta_list, top_k * 2)
+            retrieved = retrieve_vector(qtext, index, meta_list, top_k * 2)
         elif retrieval_mode == "bm25_only":
-            retrieved = retrieve_bm25(q["question"], meta_list, top_k * 2)
+            retrieved = retrieve_bm25(qtext, meta_list, top_k * 2)
         else:
-            retrieved = retrieve_hybrid(q["question"], index, meta_list, top_k * 2)
+            retrieved = retrieve_hybrid(qtext, index, meta_list, top_k * 2)
 
         retrieved = retrieved[:top_k]
 

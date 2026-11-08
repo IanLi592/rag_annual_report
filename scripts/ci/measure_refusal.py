@@ -38,7 +38,17 @@ def load_refusal_questions() -> list[dict]:
     return [q for q in qs if q.get("category") == "refusal"]
 
 
-def run_config(pipe, rows: list[dict], use_rerank: bool, floor: float | None) -> dict:
+def load_control_questions(n: int) -> list[dict]:
+    """可答题控制组：只测“该答的有没有被误拒”，防止全拒也报 100%。"""
+    path = REPO / "evaluation" / "questions_v2.json"
+    qs = json.loads(path.read_text(encoding="utf-8"))["questions"]
+    pool = [q for q in qs
+            if q.get("category") in ("numeric", "multihop") and q.get("target_docs")]
+    return pool[:n]
+
+
+def run_config(pipe, rows: list[dict], use_rerank: bool, floor: float | None,
+               control: list[dict] | None = None) -> dict:
     pipe.use_rerank = use_rerank
     pipe.rerank_min_score = floor
     out = []
@@ -54,11 +64,28 @@ def run_config(pipe, rows: list[dict], use_rerank: bool, floor: float | None) ->
             "answer": r.get("answer", ""),
         })
 
+    control_out = []
+    for q in (control or []):
+        r = pipe.query(q["question"], verbose=False)
+        n_ctx = len(r.get("retrieved") or [])
+        category = classify_refusal(r.get("answer", ""), n_ctx)
+        control_out.append({
+            "id": q["id"],
+            "question": q["question"],
+            "n_ctx": n_ctx,
+            "category": category,
+            "answer": r.get("answer", ""),
+        })
+
     n = len(out)
     refused = sum(1 for x in out if x["category"] == "refused_with_context")
     empty = sum(1 for x in out if x["category"] == "empty_context")
     answered = sum(1 for x in out if x["category"] == "answered")
     judgeable = n - empty
+    c_n = len(control_out)
+    c_refused = sum(1 for x in control_out if x["category"] == "refused_with_context")
+    c_empty = sum(1 for x in control_out if x["category"] == "empty_context")
+    c_answered = sum(1 for x in control_out if x["category"] == "answered")
     return {
         "use_rerank": use_rerank,
         "floor": floor,
@@ -68,13 +95,22 @@ def run_config(pipe, rows: list[dict], use_rerank: bool, floor: float | None) ->
         "answered": answered,
         "refusal_rate_all": round(refused / n, 4) if n else 0.0,
         "refusal_rate_judgeable": round(refused / judgeable, 4) if judgeable else 0.0,
+        "control_n": c_n,
+        "control_answered": c_answered,
+        "control_refused": c_refused,
+        "control_empty": c_empty,
+        "control_answer_rate": round(c_answered / c_n, 4) if c_n else None,
+        "control_false_refusal_rate": round((c_refused + c_empty) / c_n, 4) if c_n else None,
         "rows": out,
+        "control_rows": control_out,
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", choices=["served", "eval", "both"], default="both")
+    ap.add_argument("--control", type=int, default=10,
+                    help="可答题控制组数量；0 = 不测误拒率")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -83,6 +119,7 @@ def main() -> int:
         return 2
     try:
         qs = load_refusal_questions()
+        control = load_control_questions(a.control)
     except FileNotFoundError as e:
         print(f"[CI][SKIP] {e}")
         return 2
@@ -100,15 +137,20 @@ def main() -> int:
     results = []
     for name, use_rerank, floor in configs:
         print(f"\n── {name}: use_rerank={use_rerank} floor={floor} ──")
-        res = run_config(pipe, qs, use_rerank, floor)
+        res = run_config(pipe, qs, use_rerank, floor, control=control)
         res["config"] = name
         results.append(res)
         print(
             f"  {res['n']} 题：真拒答 {res['refused_with_context']} / "
             f"空检索 {res['empty_context']} / 正常回答 {res['answered']}；"
             f"可判定题拒答率 {res['refusal_rate_judgeable']:.1%}")
+        if res["control_n"]:
+            print(
+                f"  控制组 {res['control_n']} 题：正常回答 {res['control_answered']} / "
+                f"误拒 {res['control_refused']} / 空检索 {res['control_empty']}；"
+                f"正常回答率 {res['control_answer_rate']:.1%}")
 
-    payload = {"questions": len(qs), "configs": results}
+    payload = {"questions": len(qs), "control_questions": len(control), "configs": results}
     out = Path(a.out) if a.out else REPO / "evaluation" / "results" / "refusal_measure_latest.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

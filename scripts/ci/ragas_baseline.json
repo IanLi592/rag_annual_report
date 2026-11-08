@@ -1,21 +1,21 @@
 {
   "pipeline": "native",
-  "timestamp": "20261107_185656",
+  "timestamp": "20261107_221858",
   "scores": {
     "pipeline": "native",
-    "faithfulness": 0.3371212121212121,
-    "answer_relevancy": 0.3284803117391118,
-    "context_precision": 0.6064814814404321,
-    "context_recall": 0.20833333333333334
+    "faithfulness": 0.7427849927849928,
+    "answer_relevancy": 0.6467323427190336,
+    "context_precision": 0.26296296294780863,
+    "context_recall": 0.5
   },
   "raw_results": [
     {
       "question_id": 1,
       "question_type": "precise_number",
       "ragas": {
-        "faithfulness": 0.0,
-        "answer_relevancy": 0.9775785630532002,
-        "context_precision": 0.9999999999,
+        "faithfulness": 1.0,
+        "answer_relevancy": 0.9994804297012813,
+        "context_precision": 0.699999999965,
         "context_recall": 1.0
       }
     },
@@ -23,40 +23,40 @@
       "question_id": 2,
       "question_type": "precise_number",
       "ragas": {
-        "faithfulness": null,
-        "answer_relevancy": 0.9933033073814707,
-        "context_precision": 0.9999999999,
-        "context_recall": 0.0
+        "faithfulness": 1.0,
+        "answer_relevancy": 0.9998734888232428,
+        "context_precision": 0.19999999998,
+        "context_recall": 1.0
       }
     },
     {
       "question_id": 37,
       "question_type": "time_trend",
       "ragas": {
-        "faithfulness": 0.625,
+        "faithfulness": 0.9090909090909091,
         "answer_relevancy": 0.0,
         "context_precision": 0.0,
-        "context_recall": 0.0
+        "context_recall": 0.5
       }
     },
     {
       "question_id": 38,
       "question_type": "time_trend",
       "ragas": {
-        "faithfulness": 0.45454545454545453,
+        "faithfulness": 0.7142857142857143,
         "answer_relevancy": 0.0,
         "context_precision": 0.0,
-        "context_recall": 0.25
+        "context_recall": 0.0
       }
     },
     {
       "question_id": 71,
       "question_type": "precise_number",
       "ragas": {
-        "faithfulness": 0.2727272727272727,
-        "answer_relevancy": 0.0,
-        "context_precision": 0.6388888888675925,
-        "context_recall": 0.0
+        "faithfulness": 0.5,
+        "answer_relevancy": 0.9076317940604194,
+        "context_precision": 0.4777777777618519,
+        "context_recall": 0.5
       }
     },
     {
@@ -64,8 +64,8 @@
       "question_type": "precise_number",
       "ragas": {
         "faithfulness": 0.3333333333333333,
-        "answer_relevancy": 0.0,
-        "context_precision": 0.999999999975,
+        "answer_relevancy": 0.9734083437292576,
+        "context_precision": 0.19999999998,
         "context_recall": 0.0
       }
     }
@@ -79,5 +79,5 @@
     72
   ],
   "question_set": "v2",
-  "created_at": "2026-11-07T18:56:56+0800"
+  "created_at": "2026-11-07T22:18:59+0800"
 }

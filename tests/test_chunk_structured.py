@@ -47,6 +47,17 @@ def test_summary_pairs_header_with_values():
     assert "行「净利润」：2023年: 74,734,071,550.75" in s
 
 
+def test_summary_includes_company_and_year():
+    s = cd.summarize_table(TABLE, "第十节 财务报告", company="贵州茅台", year="2023")
+    assert s.startswith("【表格摘要】贵州茅台2023年报 · 第十节 财务报告")
+
+
+def test_structured_children_pass_company_into_summary():
+    children, _ = cd.chunk_structured(
+        [blk("table", "| 项目 |", raw=TABLE)], company="贵州茅台", year="2023")
+    assert any("贵州茅台2023年报" in c["content"] for c in children)
+
+
 def test_summary_of_empty_table_is_empty():
     assert cd.summarize_table([], "x") == ""
     assert cd.summarize_table([["", ""], ["", ""]], "x") == ""

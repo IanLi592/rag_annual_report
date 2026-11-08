@@ -92,11 +92,12 @@ def main() -> int:
 
         hits, mrrs, chars, docs_n = [], [], [], []
         for q in qs:
-            v = vec.search(q["question"], rp.TOP_K_RETRIEVE)
-            b = bm.search(q["question"], rp.TOP_K_RETRIEVE)
+            qtext = rp.expand_query_entities(q["question"], meta)
+            v = vec.search(qtext, rp.TOP_K_RETRIEVE)
+            b = bm.search(qtext, rp.TOP_K_RETRIEVE)
             cands = rp.reciprocal_rank_fusion(v, b)
             if a.rerank:
-                final = rp.rerank(q["question"], cands, a.top_k, a.floor)
+                final = rp.rerank(qtext, cands, a.top_k, a.floor)
             else:
                 final = cands[:a.top_k]
             ctx, _ = rp.build_context(final, parents)

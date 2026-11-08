@@ -118,6 +118,10 @@ def chunk_semantic(
                     "block_types": ["table"],
                     "is_ocr":   block["is_ocr"],
                     "heading_level": block.get("heading_level", 0),
+                    # 默认 semantic 索引也保留原始二维表：/table/lookup 与
+                    # --table-row 不必先切到 structured 才能用
+                    "table_json": clean_table(block.get("raw_table")),
+                    "parent_id": "",
                 }
             }
             continue
@@ -214,7 +218,8 @@ def clean_table(raw: list) -> list:
     return [[r[j] for j in keep_cols] for r in rows]
 
 
-def summarize_table(raw: list, section: str, max_rows: int = 10) -> str:
+def summarize_table(raw: list, section: str, company: str = "", year: str = "",
+                    max_rows: int = 10) -> str:
     """把二维表压成一段**可 embedding 的自然语言摘要**。
 
     为什么需要：表格拍平成 markdown 管道文本后，embedding 看到的是大量孤立的
@@ -223,7 +228,9 @@ def summarize_table(raw: list, section: str, max_rows: int = 10) -> str:
     原始结构另存 table_json 供精确提取，两者不互相替代。
 
     格式约定（第一列当行标签，其余列与表头配对）：
-      【表格摘要】<章节>。行「营业收入」：2023年: 147,693,604,994.14，2022年: 124,099,843,771.99；…
+      【表格摘要】<公司><年份>年报 · <章节>。行「营业收入」：2023年: 147,693,604,994.14，…
+    公司/年份显式写进摘要：章节路径清理掉“公司名/封面日期”污染后，表格块本身
+    不再含公司信号，只靠“营业收入”无法区分 5 家公司。
     早先版本把第一列也当普通列配对，产出"项目: 营业收入"这种无信息量的对子。
     """
     t = clean_table(raw)
@@ -236,7 +243,8 @@ def summarize_table(raw: list, section: str, max_rows: int = 10) -> str:
         pairs = [f"{h}: {v}" for h, v in zip(header[1:], r[1:]) if h and v]
         if pairs:
             lines.append(f"行「{label}」：" + "，".join(pairs))
-    head = f"【表格摘要】{section}。" if section else "【表格摘要】"
+    prefix = f"{company}{year}年报" if company or year else ""
+    head = f"【表格摘要】{prefix}{' · ' if prefix and section else ''}{section}。" if (prefix or section) else "【表格摘要】"
     return head + "；".join(lines)
 
 
@@ -245,6 +253,9 @@ def chunk_structured(
     max_child:  int = 800,
     min_child:  int = 100,
     parent_cap: int = 2000,
+    company:    str = "",
+    year:       str = "",
+    table_summary: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """
     章节树 Parent-Child 分块，返回 (children, parents)。
@@ -305,15 +316,20 @@ def chunk_structured(
                 if pre and len(pre) >= min_child:
                     child_chunks.append(_mk_child(pre, b, pending_titles, level))
                 pending_titles = []
-                summ = summarize_table(b.get("raw_table"), section)
-                if summ and len(summ) >= min_child // 2:
+                summ = summarize_table(b.get("raw_table"), section,
+                                       company=company, year=year) if table_summary else ""
+                # 长度门槛按**不带公司前缀**的摘要算：前缀只补上下文，
+                # 不能改变“哪些表算有效表”的集合（否则 chunk 数会漂移）
+                plain = summarize_table(b.get("raw_table"), section)
+                if len(plain) >= min_child // 2:
                     # 子块内容 = 摘要 + 原始 markdown 表格。
                     # 为什么两份都要：旧实现里表格文字同时存在于 table 块和 text 块，
                     # 去掉重复后 BM25 Hit@4 实测从 0.380 升到 0.400（§11），
                     # 说明这份“重复”并不是必要的召回增强。块内同时带摘要与原始
                     # markdown 不增加块数，既保留语义信号，又保留 table_json 的结构。
+                    content = (summ + "\n" if summ else "") + b["content"]
                     child_chunks.append({
-                        "content": summ + "\n" + b["content"],
+                        "content": content,
                         "metadata": {
                             "page_num": b["page_num"],
                             "section": section,
@@ -430,7 +446,11 @@ def process_file(parsed_path: Path, strategy: str = STRATEGY):
             raw_chunks.append(chunk)
 
     elif strategy == "structured":
-        children, parents = chunk_structured(blocks)
+        children, parents = chunk_structured(
+            blocks,
+            company=meta.get("company_name", ""),
+            year=year,
+        )
         raw_chunks = children
         # 父块单独存 sidecar：子块只带 parent_id，不再整份复制父内容
         # （策略 C 的存储冗余就是那么来的）

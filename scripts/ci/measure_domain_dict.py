@@ -63,12 +63,13 @@ def evaluate_child(top_k: int, out_path: str, mode: str = "bm25") -> int:
 
     hits, mrrs, missed = [], [], []
     for q in qs:
+        qtext = rp.expand_query_entities(q["question"], store.meta_list)
         if mode == "hybrid":
-            v = vec.search(q["question"], top_k * 2)
-            b = store.search(q["question"], top_k * 2)
+            v = vec.search(qtext, top_k * 2)
+            b = store.search(qtext, top_k * 2)
             retrieved = rp.reciprocal_rank_fusion(v, b)[:top_k]
         else:
-            retrieved = store.search(q["question"], top_k * 2)[:top_k]
+            retrieved = store.search(qtext, top_k * 2)[:top_k]
         # 与 compare_strategies.compute_metrics 同样的判定：doc_key 前缀匹配
         first = None
         for i, item in enumerate(retrieved, 1):

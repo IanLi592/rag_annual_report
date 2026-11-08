@@ -97,7 +97,8 @@ chunk_size=500字符，overlap=50字符
 遇标题强制切块，段落合并不超过 800 字符
 ```
 - 遇 `title` 块：先 flush 缓冲区，标题单独成块
-- 遇 `table` 块：单独成块（不与文字混合）
+- 遇 `table` 块：单独成块（不与文字混合），同时写入 `metadata.table_json`
+  （原始二维结构）；因此默认 semantic 索引也能做表格精确取数
 - 遇 `text` 块：累积到 800 字符再切
 - 效果：保留语义完整性，章节边界清晰
 
@@ -115,12 +116,16 @@ chunk_size=500字符，overlap=50字符
 父块：整章拼接（≤2000 字符），单独写入 parents.json
 ```
 - 表格子块 = 表格摘要 + 原始 Markdown，原始二维结构进 `metadata.table_json`
+- structured 的摘要前缀带公司名/年份（`【表格摘要】五粮液2021年报 · 章节`），
+  同一指标在多份年报里重复出现时更容易被问题命中；BM25 A/B 显示摘要文本会
+  稀释关键词分数（Hit@4 0.72→0.68），所以该前缀**只用于 structured 子块**，
+  semantic/BM25 不受影响（见 `docs/resume_gap_plan.md` §15）
 - `heading_level` 优先取解析阶段显式的 H1/H2/H3，缺失时退回 `section_path` 深度
 - 检索时"子块召回、父块拼装"：`rag_pipeline.resolve_chunk_content` 按
   `parent_id` 查 `parents.json`，查不到再退回内联 `parent_content` / 子块自身
 - 落盘到 `vectorstore/structured/`，通过 `RAG_INDEX_DIR` 或 `--index-dir` 切换；
   **不设为默认**——100 题实测混合检索上弱于 semantic（见 `docs/resume_gap_plan.md` §11）
-- 章节栈修复后（2026-11-07）重新分块：6,838 个 chunks / 4,175 个 parents；
+- 章节栈修复后（2026-11-07）重新分块：6,838 个 chunks / 4,195 个 parents；
   章节根被“目录/公司名/日期”污染的比例从 57% 降到 0.6%（指标待重测）
 
 **实际产出**（语义分块）：7,931 个 chunks，平均 526 字符（2026-11-07 解析去重后；去重前 10,352）
@@ -201,14 +206,32 @@ score(d) = Σ 1 / (k + rank_i(d))    k = 60（经验值）
 - 对 RRF 融合后的候选集（top-10→top-20）精排，输出 top-4 给 LLM
 - 原理：双向 attention 对 (query, doc) 对打分，比 bi-encoder 更准确但不可向量化
 - 若未下载模型则自动降级为直接截断
+- **分数下限默认关闭**（`RERANK_MIN_SCORE` 未设）：100 题实测基线 RRF
+  Hit@4 0.960 / MRR 0.831，重排后 0.890 / 0.735；下限 0.70 为 0.850 / 0.708，
+  没有任何阈值能同时提升 Hit 和削减上下文。数字题重排 MRR 有提升
+  （0.884→0.926），但多跳/幻觉题变差，因此不设为默认（§15）
 
-#### 表格精确取数（structured 索引）
-- 表格子块在 `metadata.table_json` 保存原始二维结构
+#### 查询实体归一
+- 题集和真实用户都可能输入 6 位股票代码，而 chunk 正文只有公司简称
+  （“五粮液”），代码在正文里不出现，会人为压低召回。
+- `expand_query_entities()` 在检索前把已知代码替换成 `简称+代码`
+  （如 `000858` → `五粮液000858`），向量/BM25/重排都用扩展后的 query，
+  送 LLM 的仍是原问题。36 道数字题实测：semantic Hit@4 0.500→1.000、
+  MRR 0.317→0.847；structured 0.306→0.972、MRR 0.157→0.810。
+- 题集中的 100 道代码题干已改写成自然公司名（`normalize_question_entities.py`），
+  代码扩展保留为线上兜底。
+
+#### 表格精确取数（默认 semantic + structured 索引均可用）
+- 表格块在 `metadata.table_json` 保存原始二维结构
 - 检索命中表格后，`lookup_table_value()` 按首列行标签直接取整行，
   不经过 LLM，避免从 Markdown 里重新数格子
 - 候选集全落空时，按问题推断的 `stock_code`/`year` 在全部表格块里兜底扫描
   （报表页数字密集，向量相似度常输给审计意见等叙述页）；推断不出公司则不扫，
   防止跨公司串数
+- `query()` 生成前还会做**表格行补位**：问题里点名的指标（总资产、营业收入、
+  归母净资产等）若在收窄后的表格池里有精确行，就追加一条上下文补进去。
+  实测 36 道数字题里，不做补位只有 12 道正常回答，补位后 36 道全部答对
+  （同一批题上调过标签映射，存在过拟合风险，见 `docs/resume_gap_plan.md` §15）
 - 消费端：CLI `--table-row`、HTTP `POST /table/lookup`
 
 ---
@@ -243,7 +266,9 @@ score(d) = Σ 1 / (k + rank_i(d))    k = 60（经验值）
 ### 4.1 评测题集（v2 125 题；v1 20 题保留旧口径）
 
 v2 四类：`numeric` 36 / `multihop` 34 / `hallucination` 30 / `refusal` 25，
-由 `data/parsed` 派生并经 `verify_question_set.py` 逐字校验。
+由 `data/parsed` 派生并经 `verify_question_set.py` 逐字校验。题干统一用公司
+简称（100 道原代码题干已改写），避免“用户输入股票代码”这种非自然问法把
+召回指标压低；代码兜底仍由 `expand_query_entities()` 提供。
 
 v1 旧口径（ARCHITECTURE 里早期数字的来源）：
 
@@ -272,6 +297,11 @@ v1 旧口径（ARCHITECTURE 里早期数字的来源）：
 默认只报告不拦人（`CI_EVAL_STRICT=1` 才以回退为失败），因为 6 题上的 RAGAS 抖动大；
 完整口径仍用 `python evaluation/evaluate.py --question-set v2`。
 
+**拒答控制组**：`scripts/ci/measure_refusal.py` 把回答分成“真拒答 / 空检索 /
+正常回答”三类，并额外跑一组应答题（numeric + multihop）。只测 25 道拒答题
+会把“全拒”误判成 100%：拒答题 25/25 真拒答、0 空检索的同时，控制组 36 题
+在表格行补位前只有 12 题正常回答，补位后 36/36 答对（开发集，存在过拟合风险）。
+
 ### 4.3 消融实验矩阵
 
 ```
@@ -294,7 +324,7 @@ v1 旧口径（ARCHITECTURE 里早期数字的来源）：
 | 五粮液搜索无结果 | cninfo 存储为 "五 粮 液"（字间有空格）| 拆字加空格作为 fallback 关键词 |
 | DashScope embedding 报错 batch too large | text-embedding-v3 上限为 10 条，非文档宣传的 25 | `BATCH_SIZE = 10` |
 | 开启 BM25 时答案始终"无法找到" | 阈值 0.25 对余弦相似度设计，RRF 分数 ~0.016 量纲完全不同 | 阈值检查始终读 `vec_score` |
-| 表格内容在 table 和 text 块中重复 | `parse_pdf.py` 收集了 `table_bboxes` 但未用于过滤文字区域 | 已知 Bug，影响 chunk 数量但不影响答案质量 |
+| 表格内容在 table 和 text 块中重复 | `parse_pdf.py` 收集了 `table_bboxes` 但未用于过滤文字区域 | 已修：文字块按表格 bbox 过滤（43,048→39,499 blocks，−8.2%） |
 
 ---
 

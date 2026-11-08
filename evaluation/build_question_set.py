@@ -267,7 +267,13 @@ def ev(cand: dict) -> list[dict]:
     return out
 
 
-def make_questions(facts: dict):
+def make_questions(facts: dict, names: dict | None = None):
+    names = names or {}
+
+    def nm(code: str) -> str:
+        """题干用公司简称，不用股票代码：真实用户不会问“000858在2021年…”。"""
+        return names.get(code, code)
+
     ids = iter(range(1, 10_000))
     by_cm = defaultdict(dict)
     for (code, year, metric), f in facts.items():
@@ -282,7 +288,7 @@ def make_questions(facts: dict):
         numeric.append({
             "id": next(ids), "category": "numeric", "type": "precise_number",
             "difficulty": "easy",
-            "question": f"{code}在{year}年的{metric}是多少？",
+            "question": f"{nm(code)}在{year}年的{metric}是多少？",
             "target_docs": [f"{code}_{year}"],
             "ground_truth": f"{year}年{metric}为 {f['value']}。",
             "evidence": ev(s), "unit_in_source": s.get("unit_in_source", ""),
@@ -300,7 +306,7 @@ def make_questions(facts: dict):
         multihop.append({
             "id": next(ids), "category": "multihop", "type": "time_trend",
             "difficulty": "hard",
-            "question": f"{code}的{metric}在{years[0]}到{years[-1]}年整体是上升还是下降？各年分别是多少？",
+            "question": f"{nm(code)}的{metric}在{years[0]}到{years[-1]}年整体是上升还是下降？各年分别是多少？",
             "target_docs": [f"{code}_{y}" for y in years],
             "ground_truth": f"整体{trend}。" + "，".join(
                 f"{y}年 {per[y]['value']}" for y in years) + "。",
@@ -331,7 +337,7 @@ def make_questions(facts: dict):
                 multihop.append({
                     "id": next(ids), "category": "multihop", "type": "cross_doc_compare",
                     "difficulty": "hard",
-                    "question": f"{year}年，{a}和{b}的{metric}相比哪家更高？分别是多少？",
+                    "question": f"{year}年，{nm(a)}和{nm(b)}的{metric}相比哪家更高？分别是多少？",
                     "target_docs": [f"{a}_{year}", f"{b}_{year}"],
                     "ground_truth": f"{hi_code} 更高：{hi_code} 为 {hi_v}，{lo_code} 为 {lo_v}。",
                     "evidence": ev(per[a]["sources"][0]) + ev(per[b]["sources"][0]),
@@ -350,7 +356,7 @@ def make_questions(facts: dict):
         halluc.append({
             "id": next(ids), "category": "hallucination", "type": "precise_number",
             "difficulty": "hard",
-            "question": f"{fake}在{year}年的{metric}是不是 {f['value']} ？",
+            "question": f"{nm(fake)}在{year}年的{metric}是不是 {f['value']} ？",
             "target_docs": [f"{fake}_{year}"],
             "ground_truth": (f"不是。{f['value']} 是 {code} 在 {year} 年的{metric}，"
                              f"不属于 {fake}；应回答 {fake} 自己的数值。"),
@@ -362,7 +368,7 @@ def make_questions(facts: dict):
         halluc.append({
             "id": next(ids), "category": "hallucination", "type": "time_trend",
             "difficulty": "medium",
-            "question": f"{code}{wy}年的{metric}是 {f['value']} 吗？",
+            "question": f"{nm(code)}{wy}年的{metric}是 {f['value']} 吗？",
             "target_docs": [f"{code}_{year}"],
             "ground_truth": (f"{f['value']} 对应 {year} 年，不是 {wy} 年。"
                              f"若资料中没有 {wy} 年数据，应说明无法确认。"),
@@ -427,7 +433,8 @@ def main() -> int:
         print("[FAIL] 可用事实太少（<60），够不出 100+ 题")
         return 1
 
-    numeric, multihop, halluc = make_questions(facts)
+    numeric, multihop, halluc = make_questions(
+        facts, {k[0]: d["meta"].get("company_name", k[0]) for k, d in docs.items()})
     refusal = make_refusal()
     allq = numeric + multihop + halluc + refusal
     for i, q in enumerate(allq, 1):

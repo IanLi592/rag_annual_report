@@ -24,23 +24,24 @@
 | # | 简历原文 | 代码现状 | 判定 |
 |---|---|---|---|
 | 1 | 向量/BM25 召回 → RRF 多路融合 | ✅ `rag_pipeline.py:360/366/198` | **成立** |
-| 2 | → BGE-Reranker 重排，形成两阶段漏斗 | ✅ **已打开**（`serve.py` `use_rerank=True`），模型改为进程级单例；分数下限默认关闭，由 `RERANK_MIN_SCORE` 控制，待 100 题重定（§12） | **服务路径已成立，阈值待重定** |
-| 3 | Embedding 环节加入领域词表（扣非净利润/商誉减值）防切词粉碎 | ❌ 全仓无 `load_user_dict`/`add_word`，jieba 用默认词典 | **缺失** |
-| 4 | 通过重排过滤长尾低分文档，上下文 Token 削减 40% | ❌ 无任何测量 | **数字无依据** |
-| 5 | MRR@K 命中提升 15% 以上 | ❌ 消融脚本 `compare_strategies.py` 存在但从未跑过 | **数字无依据** |
+| 2 | → BGE-Reranker 重排，形成两阶段漏斗 | ✅ **已打开**（`serve.py` `use_rerank=True`），模型为进程级单例；分数下限默认关闭。100 题实测重排整体低于 RRF 基线（Hit@4 0.960→0.890、MRR 0.831→0.735），因此不设默认阈值 | **服务路径成立；简历不应写“整体提升”** |
+| 3 | Embedding 环节加入领域词表（扣非净利润/商誉减值）防切词粉碎 | ⚠️ 词表已实现（`src/domain_dict.txt` 157 词，jieba 加载）但只作用于 BM25/关键词召回；DashScope embedding 服务端自行 tokenize，外部词表影响不到 | **机制成立，简历措辞需改为“关键词召回环节”** |
+| 4 | 通过重排过滤长尾低分文档，上下文 Token 削减 40% | ❌ 无阈值时字符数只增不减；下限 0.70 可减 16% 字符，但 Hit@4 从 0.560 掉到 0.410。没有阈值能同时提升 Hit 和削减上下文 | **数字不成立，需删除或改写** |
+| 5 | MRR@K 命中提升 15% 以上 | ❌ 100 题整体重排 MRR 0.831→0.735；只有 36 道数字题重排 MRR 0.884→0.926（+4.8%），达不到 15% | **数字不成立，需按数字题口径重写** |
 | 6 | 引入视觉大模型 Qwen-VL 重构 PDF 解析流水线 | ✅ 已实现可选分支（`src/parse_pdf_vlm.py`）：复杂页路由、JSON 块输出、按页缓存、预算上限、失败回退；默认 `VLM_MODE=off` | **机制成立；尚未全量跑，效果待抽样实测** |
-| 7 | 复杂表格结构化为 JSON 入库 | ✅ `block_type=table` 的块保留 `raw_table`，structured 子块写入 `metadata.table_json`，并进入 `faiss_meta.json` | **成立（structured 索引）** |
-| 8 | Embedding 前设计「表格摘要注入机制」，提升向量召回、保留原始结构供精确提取 | ✅ `chunk_structured`：表格子块 = 摘要文本（供 embedding）+ 原始 Markdown（保检索面），`table_json` 供精确提取；解析层表格重复发射已修 | **机制成立；增益无支持性数据（§11）** |
-| 9 | 核心财务指标检索准确率提升 25% 以上 | ❌ 无测量 | **数字无依据** |
+| 7 | 复杂表格结构化为 JSON 入库 | ✅ `block_type=table` 的块保留 `raw_table`；semantic 与 structured 的表格块都写 `metadata.table_json` 并进入 `faiss_meta.json` | **成立（默认 semantic + structured）** |
+| 8 | Embedding 前设计「表格摘要注入机制」，提升向量召回、保留原始结构供精确提取 | ✅ structured 表格子块 = 公司/年份前缀摘要 + 原始 Markdown，`table_json` 供精确提取；36 道数字题 structured Hit@4 1.000 / MRR 0.968。但 BM25-only A/B 摘要开 0.68 vs 关 0.72，说明摘要文本会稀释关键词分数，未推广到 semantic/BM25 | **机制成立；收益仅限 structured 向量召回（§15）** |
+| 9 | 核心财务指标检索准确率提升 25% 以上 | ⚠️ 数字题可答题正常回答率 12/36→36/36（表格行补位，开发集，存在过拟合）；检索侧 semantic 36 题 Hit@4 0.500→1.000（实体归一）。“+25%”不是可直接引用的泛化数字 | **机制有数据；泛化数字不成立** |
 | 10 | 基于 PyMuPDF 提取标题层级 H1/H2/H3 | ✅ `classify_heading` / `ParsedBlock.heading_level`；章节栈显式记录 H1/H2/H3，随块进入 chunk/index | **成立** |
 | 11 | 语义 + 结构树递归分块 Parent-Child | ✅ `chunk_structured`：按 `section_path` 建章节树，父块单独存 `parents.json`，子块只留 `parent_id`；索引在 `vectorstore/structured/` | **机制成立；未晋升默认（§11）** |
 | 12 | 检索时「子块召回、父块拼装」 | ✅ `resolve_chunk_content` 按 `parent_id` 查父块表，主链路与 `/query/debug` 同口径；semantic 索引无 parents.json 时行为不变 | **structured 路径成立** |
 | 13 | 系统提示词强制仅依据检索内容作答并标注来源编号 | ✅ `rag_pipeline.py:57` 五条规则，含拒答与 `[n]` 引用 | **成立** |
-| 14 | 应拒绝回答类实现 100% 拒答正确率 | ⚠️ 度量机制在（`evaluate.py:257-262` 关键词判 refused，算 refuse_rate），但**只有 3 道该类题，且从未跑出过数字** | **需扩题+实测** |
-| 15 | 设计 100+ 道题（幻觉对抗/多跳推理/数字计算/应拒绝回答四类）；RAGAS 接入 CI，每次调整 Chunk 大小或 Prompt 后自动输出对比报告 | ❌ 实际 **20 题、5 类**（simple_fact/precise_number/cross_doc_compare/time_trend/should_refuse）；⚠️ RAGAS 已接 CI（`run_eval.sh` + 探针 + 预检），但**不会在 chunk/prompt 变更时自动触发，也没有 baseline vs new 对比报告** | **规模缺失 + 自动化缺失** |
+| 14 | 应拒绝回答类实现 100% 拒答正确率 | ✅ 25 道 refusal 实测 **25/25 真拒答、0 空检索**；并用 36 道可答题做控制组防“全拒”：补位前 12/36、补位后 36/36（开发集，§15） | **成立；控制组需注明开发集口径** |
+| 15 | 设计 100+ 道题（幻觉对抗/多跳推理/数字计算/应拒绝回答四类）；RAGAS 接入 CI，每次调整 Chunk 大小或 Prompt 后自动输出对比报告 | ✅ v2 已扩到 **125 题、四类**（numeric 36 / multihop 34 / hallucination 30 / refusal 25，逐题原文证据 + 校验器）；RAGAS 对比门已接 CI（`check_eval_compare.sh` + `ragas_baseline.json`），pre-push 在解析/分块/Prompt/题集变更时自动跑 6 题冒烟 | **成立（§8 / §14）** |
 
 **统计（初审时）**：成立 3 条 ｜ 半成立/需对齐措辞 4 条 ｜ 机制缺失 5 条 ｜ 数字无依据 4 条（含与机制缺失重叠）。
-P0 代码落地后，第 6/7/8/10/11/12 条机制已补，**数字项仍需统一重测**（见 §12）。
+P0 代码落地后，第 6/7/8/10/11/12 条机制已补；数字项已在 §12–§15 统一重测，
+其中“Token 削减 40%”“MRR +15%”“核心指标 +25%”三项不成立（见 §15）。
 
 ---
 
@@ -462,7 +463,7 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 
 `parse_pdf.py` 的 `table_bboxes` 收集后从未使用（注释写着"后续跳过"但代码没跳），
 导致表格文字既进 table 块又流进 text 块：实测摘要页 **77% 的文字行**落在表格 bbox 内，
-全量约 3,155 个重复块（43048 → 39893，−7.3%）。修复后抽查 200 个表格块，
+全量约 3,549 个重复块（43,048 → 39,499，−8.2%）。修复后抽查 200 个表格块，
 表头重复进 text 块的数量从 ~200 降到 **0**。
 
 旧主索引是旧解析数据的产物，与去重后的 chunks 不一致 —— 已把旧索引留档到
@@ -481,7 +482,7 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 
 ---
 
-## 12. P0 代码落地状态（2026-11-07，指标待统一重测）
+## 12. P0 代码落地状态（2026-11-07，指标见 §15）
 
 本轮只改代码与口径，**不重测、不调阈值**；所有百分比等全部代码稳定后统一测量，
 避免"边改边测"导致前后不可比。
@@ -494,8 +495,9 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 | P0-4 Parent-Child 拼装 | ✅ structured 路径生效 | `resolve_chunk_content`（父块表 → 内联 parent_content → 子块），`/query/debug` 与主链路同口径 |
 | P0-5 拒答口径 | ✅ 三分类 + 25 题实测 | `src/refusal.py`：真拒答 / 空检索 / 正常回答；重测（`refusal_measure_20261107b.log`）：served 与 eval 均 **25/25 真拒答，0 空检索**，可判定题拒答率 100% |
 
-**仍需在统一重测后回填的数字**：Token 削减比例、MRR@K / Hit@K 前后差、核心财务指标
-准确率、拒答正确率、100 题基线与 structured A/B。代码完成 ≠ 简历数字成立。
+**数字已在 §15 统一重测**：Token 削减 40%、MRR +15%、核心指标 +25% 三项不成立；
+可复用的是实体归一的 36 题 Hit@4/MRR、structured 摘要的 36 题 Hit/MRR、
+以及拒答控制组的前后对比（开发集口径）。代码完成 ≠ 简历数字成立。
 
 ---
 
@@ -508,11 +510,11 @@ MRR@4 0.210 → 0.293：**绝对 +8.3pp，相对 +39.5%**。
 | P1-3 文档口径同步 | ✅ 已更新 | README / ARCHITECTURE / USAGE_GUIDE / 面试笔记统一为：125 题 v2、四种分块、领域词表只影响 BM25、表格重复与页脚脏数据已修、当前重排结论（下限默认关闭） |
 | P1-4 调试接口口径一致 | ✅ 已实现 | `/query/debug` 改为调用 `pipeline.retrieve()` 与 `pipeline.parents`，与 `/query` 共用重排、`min_score`、top-k 和父块拼装；`tests/test_rerank.py` 三条 AST 守卫钉住接线 |
 
-P1-2 的单测 `tests/test_table_lookup.py` 17 条；`--table-row "营业收入"` 在
-structured 索引上已冒烟通过，命中合并利润表原始行。补了兜底：候选集全落空时
-按问题推断的公司/年份在全部表格块里扫（报表页数字密集，向量 Top-10 会输给
-审计意见等叙述页），实测“贵州茅台2023年利润表营业收入”从 0 行恢复到 5 行，
-其中含第 65 页合并利润表 `一、营业收入 81,415,570,788.59`。
+P1-2 的单测 `tests/test_table_lookup.py` 24 条；`--table-row "营业收入"` 在
+semantic 与 structured 索引上都已冒烟通过，命中合并利润表原始行。补了兜底：
+候选集全落空时按问题推断的公司/年份在全部表格块里扫（报表页数字密集，
+向量 Top-10 会输给审计意见等叙述页），实测“贵州茅台2023年利润表营业收入”
+从 0 行恢复到 5 行，其中含第 65 页合并利润表 `一、营业收入 81,415,570,788.59`。
 
 ---
 
@@ -520,9 +522,81 @@ structured 索引上已冒烟通过，命中合并利润表原始行。补了兜
 
 | 项 | 状态 | 结果 |
 |---|---|---|
-| Parent-Child 章节树口径 | ✅ 已修 | `_update_section` 过滤目录/封面日期/公司名/TOC 点线；无“第X章”时“第X节”按 H1 处理。重新解析 15 份 PDF：主索引章节根可疑率 **63.5% → 1.5%**；structured parents **57% → 0.6%**。semantic 块内容未变，7931 条向量全部复用；structured 重分块为 6,838 chunks / 4,175 parents，重嵌 3,104 条 |
+| Parent-Child 章节树口径 | ✅ 已修 | `_update_section` 过滤目录/封面日期/公司名/TOC 点线；无“第X章”时“第X节”按 H1 处理。重新解析 15 份 PDF：主索引章节根可疑率 **63.5% → 1.5%**；structured parents **57% → 0.6%**。semantic 块内容未变，7931 条向量全部复用；structured 重分块为 6,838 chunks / 4,195 parents，重嵌 3,104 条 |
 | RAGAS 接入 CI | ✅ 已实现 | `check_eval_compare.sh` + `compare_ragas.py` + `pick_eval_ids.py`；pre-push 在改动解析/分块/Prompt/题集时自动跑 6 题冒烟对比；基线 `scripts/ci/ragas_baseline.json` 只存题号与逐题分数。默认报告不拦人，`CI_EVAL_STRICT=1` 才失败 |
 | Qwen-VL 真实页验证 | ✅ 已跑通 | 默认模型从账号不可用的 `qwen-vl-max` 改为 `qwen3-vl-plus`；茅台 2023 第 63/65 页实测每页 6 块，利润表还原为 31×4 / 27×4 `raw_table`（日志 `evaluation/results/vlm_sample_qwen3vl_20261107.log`） |
 
-**简历仍需人工修改**（代码无法代替）：领域词表改“关键词召回环节”；Token/MRR/表格 +25%
-三个数字按 §12/§13 的实测重写。
+**简历仍需人工修改**（代码无法代替）：领域词表改“关键词召回环节”；Token 削减
+40%、MRR +15%、核心指标 +25% 三个数字按 §15 的实测重写或删除。
+
+---
+
+## 15. 自然问法题集 / 实体归一 / 表格行补位（2026-11-07）
+
+### 15.1 题集改成自然问法
+
+原 125 题里有 100 题写成「000858在2021年的营业收入是多少？」。真实用户不会
+这样问，而且 chunk 正文只有「五粮液」没有代码，检索指标会被题干措辞人为压低。
+`scripts/ci/normalize_question_entities.py` 只改 `question`，不动
+`ground_truth` / `evidence`，把已知代码替换成公司简称（含 `0008582022年`
+这种连写）。改写后题集仍为 numeric 36 / multihop 34 / hallucination 30 /
+refusal 25，校验器通过。
+
+代码侧 `expand_query_entities()` 保留：用户真输代码时，检索前扩成
+`五粮液000858`。36 道数字题实测：
+
+| 索引 | 指标 | 关闭扩展 | 开启扩展 |
+|---|---|---:|---:|
+| semantic | Hit@4 | 0.500 | **1.000** |
+| semantic | MRR@4 | 0.317 | **0.847** |
+| structured | Hit@4 | 0.306 | **0.972** |
+| structured | MRR@4 | 0.157 | **0.810** |
+
+### 15.2 `table_json` 进默认索引 + structured 摘要带公司/年份
+
+- `chunk_semantic` 的表格块现在也写 `metadata.table_json`。默认索引
+  7,931 chunks 中有 4,482 个带表格结构，`--table-row` / `/table/lookup`
+  不再依赖 structured 索引。
+- `chunk_structured` 的表格摘要前缀改成
+  `【表格摘要】五粮液2021年报 · {章节}`，让向量召回能区分“同一指标、不同公司/年份”。
+  36 道数字题（structured）：Hit@4 1.000、MRR@4 0.968；semantic 为
+  1.000 / 0.847。代价是平均上下文字符 +60.9%（父块拼装导致）。
+- BM25-only 消融（`scripts/ci/measure_table_summary.py`）：摘要开
+  Hit@4 0.68 / MRR 0.3925，摘要关 0.72 / 0.4217 —— **摘要文本会稀释 BM25
+  关键词分数**，所以该前缀只用于 structured 子块，不推广到 semantic/BM25。
+
+### 15.3 拒答控制组与生成前表格补位
+
+只测 25 道拒答题会把“全拒”误判成 100%。`measure_refusal.py` 增加可答题控制组：
+
+| 配置 | 拒答题 | 控制组（36 道数字题） |
+|---|---|---|
+| 线上（重排，无下限） | 25/25 真拒答、0 空检索 | 补位前 12/36 正常回答；补位后 **36/36 且数值全部正确** |
+| 评估（无重排） | 25/25 真拒答、0 空检索 | 未单独重测 |
+
+补位机制 `RAGPipeline._table_context_items()`：问题里点名的指标（总资产、
+营业收入、归母净资产、经营现金流等）若在按公司/年份收窄的表格池里有精确行，
+就追加为一条上下文（最多 1 条）。处理了三种报表脏结构：
+
+1. 首列混入 `2021年`/`1` 等序号 —— 排除纯数字/年份类标签；
+2. 不同年份写法不同（`总资产` vs `资产总计`、`归母净资产` vs
+   `归属于母公司所有者权益合计`）—— 小同义词表，精确匹配后才用；
+3. 跨 chunk 断表/合并单元格 —— 表头疑似数据行时只报本年第一个数值；
+   合并单元格按“最近的列名”配对，并跳过增减/比例/附注列。
+
+**必须说明的口径**：36/36 是在同一批数字题上调标签映射得到的开发集结果，
+存在过拟合风险；它证明“补位机制能消除这类召回盲区”，不能当作泛化准确率。
+拒答侧没有退化（仍 25/25）。
+
+### 15.4 验证与基线
+
+- `pytest`：236 条通过（新增 `tests/test_query_entities.py` 6 条、
+  `tests/test_table_lookup.py` 扩到 24 条、`test_chunking.py` 表格
+  `table_json` 守卫）。
+- `check_static.sh` / `check_index.sh`（13 条断言）/ `check_service.sh` 全绿。
+- RAGAS 6 题冒烟基线已按最终代码重建（`scripts/ci/ragas_baseline.json`）：
+  Faithfulness 0.7428、Answer Relevancy 0.6467、Context Precision 0.2630、
+  Context Recall 0.5000。复跑对比为 Faithfulness 0.6130 / AR 0.6451 /
+  CP 0.2630 / CR 0.4722，非严格门通过。**6 题单题抖动可达 20–75pp**
+  （同一题 Faithfulness 在两次运行间 1.0→0.33），因此只用于发现结构性回归，
+  不能拿这组数字证明或否定表格补位的效果；补位的效果证据是可答题控制组。

@@ -61,6 +61,8 @@ def main() -> int:
     ap.add_argument("--sample", type=int, default=25)
     ap.add_argument("--floors", default="", help="逗号分隔的分数下限，如 0.0,0.2,0.5")
     ap.add_argument("--top-k", type=int, default=4)
+    ap.add_argument("--rerank-query", choices=["expanded", "original"], default="expanded",
+                    help="重排用实体归一后的问题还是原问题")
     a = ap.parse_args()
 
     try:
@@ -88,10 +90,12 @@ def main() -> int:
     rows = []
     all_scores: list[float] = []
     for q in qs:
-        v = vec.search(q["question"], rp.TOP_K_RETRIEVE)
-        b = bm25.search(q["question"], rp.TOP_K_RETRIEVE)
+        qtext = rp.expand_query_entities(q["question"], vec.meta_list)
+        rq = qtext if a.rerank_query == "expanded" else q["question"]
+        v = vec.search(qtext, rp.TOP_K_RETRIEVE)
+        b = bm25.search(qtext, rp.TOP_K_RETRIEVE)
         cands = rp.reciprocal_rank_fusion(v, b)
-        pairs = [(q["question"], c["content"]) for c in cands]
+        pairs = [(rq, c["content"]) for c in cands]
         scores = reranker.predict(pairs)
         for c, s in zip(cands, scores):
             c["rerank_score"] = float(s)

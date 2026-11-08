@@ -93,6 +93,49 @@ def match_filter(item: dict, filter_meta: Optional[dict]) -> bool:
     return all(str(item.get(k, "")) == str(v) for k, v in filter_meta.items())
 
 
+def company_name_map(meta_list: list[dict]) -> dict[str, str]:
+    """stock_code → 公司简称。
+
+    来源是索引 meta 的 `source_file`（`600519_2023_贵州茅台_...json`）：
+    不额外维护一份公司表，换数据集时不会与现实脱节。
+    """
+    mapping: dict[str, str] = {}
+    for item in meta_list:
+        code = str(item.get("stock_code", ""))
+        if not code:
+            continue
+        parts = Path(str(item.get("source_file", ""))).stem.split("_")
+        if len(parts) >= 3 and parts[2]:
+            mapping.setdefault(code, parts[2])
+    return mapping
+
+
+_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+
+def expand_query_entities(question: str, meta_list: list[dict]) -> str:
+    """把问题里的股票代码补成「公司简称+代码」，只扩检索 query，不改原问题。
+
+    实测改造前的 36 道数值题全写成「000858 在 2021 年的营业收入是多少」，而 chunk
+    正文只有「五粮液」没有股票代码：Top-4 经常是别的公司。补上简称后
+    semantic Hit@4 0.500→1.000、structured 0.306→0.972（rerank top-4）。
+    题集已改为自然公司名，此函数保留给线上用户输入代码时兜底。
+    问题里已经出现公司简称时不重复插入，未知代码原样保留。
+    """
+    names = company_name_map(meta_list)
+    if not names:
+        return question
+
+    def repl(m: re.Match) -> str:
+        code = m.group(1)
+        name = names.get(code)
+        if not name or name in question:
+            return m.group(0)
+        return f"{name}{code}"
+
+    return _CODE_RE.sub(repl, question)
+
+
 def infer_filter_from_question(question: str, meta_list: list[dict]) -> dict:
     """从问题文本里推断 stock_code / year，用于表格精确取数的兜底。
 
@@ -110,11 +153,7 @@ def infer_filter_from_question(question: str, meta_list: list[dict]) -> dict:
         filt["stock_code"] = codes.pop()
     elif not codes:
         # 公司名取自 source_file 的第三段（600519_2023_贵州茅台_...）
-        name_to_code: dict[str, str] = {}
-        for item in meta_list:
-            parts = Path(str(item.get("source_file", ""))).stem.split("_")
-            if len(parts) >= 3 and parts[2]:
-                name_to_code.setdefault(parts[2], str(item.get("stock_code", "")))
+        name_to_code = {n: c for c, n in company_name_map(meta_list).items()}
         matched = {code for name, code in name_to_code.items() if name in question}
         if len(matched) == 1:
             filt["stock_code"] = matched.pop()
@@ -389,8 +428,24 @@ def resolve_chunk_content(item: dict, parents: dict | None = None) -> str:
 
 
 _CELL_WS = re.compile(r"\s+")
-_LABEL_PREFIX = re.compile(r"^(?:其中|加|减)[:：]?")
+_LABEL_PREFIX = re.compile(r"^(?:(?:其中|加|减)[:：]?|[一二三四五六七八九十]+、)")
 _LABEL_UNIT = re.compile(r"[（(](?:元|万元|亿元|%|％)[）)]$")
+_CJK_RE = re.compile(r"[一-鿿]")
+# 解析残留：单元格首列偶尔带"的/在/和"这类介词，去掉后再当指标名用。
+_LABEL_FILLER = re.compile(r"^(?:的|在|和|与|及|为|是)+")
+# 增减/比例/附注列不是指标绝对值；补位只回答"是多少"，这些列会干扰取值。
+_SKIP_COL = re.compile(r"增减|变动|比例|附注|本年比上年")
+
+# 同一指标在不同年份报表里的首列写法不同（2022 年报用"资产总计"而不是
+# "总资产"）。补位只在这里做同义映射，且映射后仍要求首列精确相等。
+_TABLE_LABEL_ALIASES = {
+    "总资产": ("资产总计",),
+    "资产总额": ("资产总计",),
+    "归属于上市公司股东的净资产": (
+        "归属于母公司所有者权益合计",
+        "归属于母公司股东权益",
+    ),
+}
 
 
 def _norm_cell(value) -> str:
@@ -580,8 +635,13 @@ class RAGPipeline:
         唯一检索入口：`query()` 与 `serve.query_debug()` 都用它，保证调试接口
         不会因为复制了一份逻辑而和主链路越走越远。
         """
-        # ① 查询改写（可选）
-        retrieval_query = rewrite_query(question, self.client) if self.use_qr else question
+        # ① 查询实体归一 + 可选改写
+        #    股票代码只扩检索/重排 query，送 LLM 的仍是原问题（见 query()）
+        expanded_question = expand_query_entities(question, self.vec_store.meta_list)
+        retrieval_query = (
+            rewrite_query(expanded_question, self.client) if self.use_qr
+            else expanded_question
+        )
 
         # ② 向量检索
         vec_results = self.vec_store.search(retrieval_query, TOP_K_RETRIEVE, filter_meta)
@@ -599,8 +659,9 @@ class RAGPipeline:
             candidates = vec_results
 
         # ④ Rerank（与线上同阈值，默认不过滤）
+        #    用实体归一后的问题：代码题若只给“000858”，重排同样需要公司名
         if self.use_rerank:
-            final = rerank(question, candidates, TOP_K_RERANK, self.rerank_min_score)
+            final = rerank(expanded_question, candidates, TOP_K_RERANK, self.rerank_min_score)
         else:
             final = candidates[:TOP_K_RERANK]
 
@@ -614,6 +675,129 @@ class RAGPipeline:
             "candidates":   candidates,
             "final":        final,
         }
+
+    def _table_context_items(
+        self,
+        question: str,
+        filter_meta: Optional[dict] = None,
+    ) -> list[dict]:
+        """把问题里点名的指标行，按 `table_json` 精确取出来补进上下文。
+
+        为什么需要：自然语言问题“五粮液2021年的总资产是多少”在 RRF top-4 里
+        经常命中同一份年报的叙述段（行业情况、审计报告），而摘要表块因为数字
+        密集排不进前四 —— 实测 10 道可答题里 5 道因此误拒。表格行直接按首列
+        标签取数，不依赖排序，能补上这个召回盲区。
+
+        只在公司/年份能高置信推断时启用；最多补 1 行，避免上下文膨胀。
+        """
+        pool = self.table_pool(filter_meta, question)
+        if not pool:
+            return []
+        # 只处理单年点查：跨年趋势题需要多年份上下文，补一行本年数据
+        # 反而会挤占“逐年对比”的证据（实测 RAGAS Context Precision 下滑）。
+        filt = dict(filter_meta or {})
+        for k, v in infer_filter_from_question(
+                question, self.vec_store.meta_list).items():
+            filt.setdefault(k, v)
+        if not filt.get("year"):
+            return []
+        qn = _norm_cell(question)
+        names_map = company_name_map(self.vec_store.meta_list)
+        company = names_map.get(pool[0].get("stock_code", ""), "") if pool else ""
+        labels: set[str] = set()
+        aliases: set[str] = set()
+        cell_labels: set[str] = set()
+        for item in pool:
+            for row in item.get("table_json") or []:
+                if not row:
+                    continue
+                label = _LABEL_FILLER.sub("", _norm_label(row[0]))
+                cell_labels.add(label)
+                # 公司名碎片（"宁德"/"时代"）也会出现在问题里，不能当指标名
+                if company and (label in company or company in label):
+                    continue
+                # 表格首列常混着 "2021年" "1" 这类序号/年份，它们在问题里
+                # 也出现且往往比指标名更长，必须排除，否则会用年份去取行。
+                if (len(label) >= 2 and not label[0].isdigit()
+                        and len(_CJK_RE.findall(label)) >= 2
+                        and label in qn):
+                    labels.add(label)
+        # 同义写法（"总资产" vs "资产总计"）与直接命中一起排序：
+        # 先试更长的指标名；精确命中但整行为空（跨 chunk 断开的资产负债表）
+        # 时继续试下一个，直到取到带数值的行。
+        for canonical, names in _TABLE_LABEL_ALIASES.items():
+            if canonical in qn:
+                aliases.update(a for a in names if a in cell_labels)
+        # 排序：完整指标名（≥3 字）优先，其次同义写法，最后才是"资产/总额"
+        # 这类碎片。海康 2023 的"总资产"和收购标的的"资产总计"同时有值，
+        # 别名不能压过直接命中的主要指标行。
+        good = sorted((x for x in labels if len(x) >= 3), key=len, reverse=True)
+        short = sorted((x for x in labels if len(x) < 3), key=len, reverse=True)
+        candidates = good + sorted(aliases, key=len, reverse=True) + short
+        if not candidates:
+            return []
+
+        rows: list[dict] = []
+        for label in candidates:
+            for name in (label, *_TABLE_LABEL_ALIASES.get(label, ())):
+                found = [r for r in lookup_table_value(pool, name)
+                         if _norm_label(r["row"][0]) == _norm_label(name)
+                         and any(_norm_cell(v) for v in r["row"][1:])]
+                if found:
+                    rows = found[:1]
+                    break
+            if rows:
+                break
+        if not rows:
+            return []
+
+        by_chunk = {item.get("chunk_id"): item for item in pool}
+        out = []
+        for r in rows:
+            src = by_chunk.get(r["chunk_id"], {})
+            table = src.get("table_json") or []
+            header = table[0] if table else []
+            # header[0] 通常是"项目/年份"占位，真正的列名从下标 1 开始；
+            # 行标签必须显式写出来，否则 LLM 只看到数值不知道是哪项指标。
+            # 有些页表格跨 chunk 断开（00191 的首行是"无形资产"），表头
+            # 本身是数据行 —— 这时列名不可信，只报本年第一个数值。
+            usable = any(h and re.search(r"[一-鿿A-Za-z]", _norm_cell(h))
+                         for h in header[1:])
+            if usable:
+                # 报表常见合并单元格：数值在第 3/5 列，列名在 4/6 列，
+                # 直接 zip 会把数值和"附注"错配、甚至全部落空。
+                hdr = [_norm_cell(h) for h in header]
+                pairs = []
+                for j, v in enumerate(r["row"][1:], 1):
+                    v = _norm_cell(v)
+                    if not v:
+                        continue
+                    k = next((i for i in range(j, len(hdr)) if hdr[i]), None)
+                    if k is None:
+                        k = next((i for i in range(j - 1, -1, -1) if hdr[i]), None)
+                    col = hdr[k] if k is not None else f"第{j}列"
+                    if _SKIP_COL.search(col):
+                        continue
+                    pairs.append(f"{col}: {v}")
+            else:
+                vals = [_norm_cell(v) for v in r["row"][1:] if _norm_cell(v)]
+                pairs = [f"{r['year']}年: {vals[0]}"] if vals else []
+            if not pairs:
+                continue
+            content = "【表格精确取数】"
+            if r["stock_code"] or r["year"]:
+                content += f"{r['stock_code']} {r['year']}年报 · "
+            content += (r["section"] or "") + "\n"
+            content += f"{r['row'][0]}：{'；'.join(pairs)}"
+            out.append({
+                "chunk_id": r["chunk_id"],
+                "stock_code": r["stock_code"],
+                "year": r["year"],
+                "page_num": r["page_num"],
+                "section": r["section"],
+                "content": content,
+            })
+        return out
 
     def query(
         self,
@@ -637,6 +821,12 @@ class RAGPipeline:
                 "answer": "根据年报知识库未能找到与该问题相关的内容，建议直接查阅原始年报。",
                 "citations": [], "retrieved": final,
             }
+
+        # ⑤.5 表格精确行补位：追加而不是替换。替换会丢掉 RRF 已召回的证据
+        # （多跳题需要多年份上下文），补一行只多约 200 字符。
+        table_items = self._table_context_items(question, filter_meta)
+        if table_items:
+            final = final + table_items
 
         # ⑥ LLM 生成
         context, citations = build_context(final, self.parents)
