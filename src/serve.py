@@ -16,6 +16,7 @@ RAG 问答 HTTP 服务（FastAPI）
 
 import importlib.util
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -47,17 +48,37 @@ _module  = None   # 持有模块引用，供 debug 端点访问模块级函数
 pipeline = None   # RAGPipeline 实例
 
 
+def _env_float(name: str, default: float | None = None) -> float | None:
+    """读浮点环境变量；空串/未设置时回 default。"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _module, pipeline
     logger.info("服务启动，初始化 RAG Pipeline...")
     _module  = _load_pipeline_module()
+    index_dir = os.getenv("RAG_INDEX_DIR") or None
     pipeline = _module.RAGPipeline(
         use_bm25          = True,
-        use_rerank        = False,
+        # 精排打开，但分数下限默认关闭：
+        #   100 题实测（scripts/ci/measure_rerank.py --sample 100）
+        #   基线 RRF top4      Hit@4 0.560 / MRR@4 0.312
+        #   重排不过滤          Hit@4 0.550 / MRR@4 0.330
+        #   重排 + 下限 0.70    Hit@4 0.410 / MRR@4 0.261  ← 旧默认，已回退
+        # 0.7 是在 25 题子集上选的，100 题上会误杀大量正确文档。
+        # 要重新启用下限，先用 measure_rerank.py 在 100 题上确定新阈值。
+        use_rerank        = True,
+        rerank_min_score  = _env_float("RERANK_MIN_SCORE", None),
         use_query_rewrite = False,
+        index_dir         = index_dir,
     )
-    logger.info("Pipeline 初始化完成，开始接受请求")
+    logger.info(
+        f"Pipeline 初始化完成：索引={pipeline.index_dir} 策略={pipeline.strategy} "
+        f"rerank_min_score={pipeline.rerank_min_score}")
     yield
     logger.info("服务关闭")
 
@@ -80,9 +101,11 @@ app.add_middleware(
 # ── 数据模型 ──────────────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    question:   str           = Field(...,  example="贵州茅台2023年营业收入是多少")
-    stock_code: Optional[str] = Field(None, example="600519")
-    year:       Optional[str] = Field(None, example="2023")
+    # example 走 json_schema_extra：Field(example=...) 是 Pydantic V2 的废弃用法，
+    # V3.0 会移除（pytest 里以 PydanticDeprecatedSince20 告警形式出现过 3 条）。
+    question:   str           = Field(...,  json_schema_extra={"example": "贵州茅台2023年营业收入是多少"})
+    stock_code: Optional[str] = Field(None, json_schema_extra={"example": "600519"})
+    year:       Optional[str] = Field(None, json_schema_extra={"example": "2023"})
 
 class Citation(BaseModel):
     index:    int
@@ -92,6 +115,26 @@ class Citation(BaseModel):
 class QueryResponse(BaseModel):
     answer:    str
     citations: list[Citation]
+
+class TableLookupRequest(BaseModel):
+    question:  str           = Field(..., json_schema_extra={"example": "贵州茅台2023年财务数据"})
+    row_label: str           = Field(..., json_schema_extra={"example": "营业收入"})
+    stock_code: Optional[str] = Field(None, json_schema_extra={"example": "600519"})
+    year:       Optional[str] = Field(None, json_schema_extra={"example": "2023"})
+
+class TableRow(BaseModel):
+    chunk_id:   str
+    stock_code: str
+    year:       str
+    page_num:   int
+    section:    str
+    row:        list[str]
+
+class TableLookupResponse(BaseModel):
+    question:  str
+    row_label: str
+    matched:   int
+    rows:      list[TableRow]
 
 # ── Debug 专用模型 ────────────────────────────────────────────────────────────
 
@@ -168,7 +211,13 @@ def index():
 def health():
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
-    return {"status": "ok", "pipeline_ready": True}
+    return {
+        "status": "ok",
+        "pipeline_ready": True,
+        "index_dir": str(pipeline.index_dir),
+        "strategy": pipeline.strategy,
+        "rerank_min_score": pipeline.rerank_min_score,
+    }
 
 
 @app.post("/query", response_model=QueryResponse, summary="标准问答")
@@ -187,6 +236,33 @@ def query(req: QueryRequest):
     )
 
 
+@app.post("/table/lookup", response_model=TableLookupResponse, summary="按行标签精确取表格行")
+def table_lookup(req: TableLookupRequest):
+    """在检索候选的 `table_json` 中按首列标签取整行。
+
+    与 /query 共用检索入口，但搜索的是 RRF 后的全部候选（而非精排 top-4），
+    避免精排把正确表格挤掉；命中后直接读原始二维结构，不经过 LLM。
+    候选全落空时退回按问题推断的 stock_code/year 表格池，避免报表页因
+    数字密集在向量检索里输给叙述页。
+    """
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
+    try:
+        r = pipeline.retrieve(req.question, _filter_meta(req), verbose=False)
+        rows = _module.lookup_table_value(
+            r["candidates"], req.row_label,
+            fallback_pool=pipeline.table_pool(_filter_meta(req), req.question))
+    except Exception as e:
+        logger.error(f"Table lookup 异常: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    return TableLookupResponse(
+        question=req.question,
+        row_label=req.row_label,
+        matched=len(rows),
+        rows=[TableRow(**row) for row in rows],
+    )
+
+
 @app.post("/query/debug", response_model=DebugResponse, summary="调试接口：逐步返回中间结果")
 def query_debug(req: QueryRequest):
     """
@@ -201,28 +277,22 @@ def query_debug(req: QueryRequest):
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline 尚未初始化")
 
-    TOP_K       = _module.TOP_K_RETRIEVE   # 10
-    TOP_K_FINAL = _module.TOP_K_RERANK     # 4
-    fm          = _filter_meta(req)
+    fm = _filter_meta(req)
 
     try:
-        # ① 向量检索
-        vec_results  = pipeline.vec_store.search(req.question, TOP_K, fm)
-        vec_rank_map = {item["chunk_id"]: rank for rank, item in enumerate(vec_results, 1)}
+        # 与 /query 共用同一个检索入口（改写→向量/BM25→RRF→精排同阈值），
+        # 调试接口不再自己复制一份逻辑。
+        r = pipeline.retrieve(req.question, fm, verbose=False)
+        vec_results  = r["vec_results"]
+        bm25_results = r["bm25_results"]
+        candidates   = r["candidates"]
+        final        = r["final"]
 
-        # ② BM25 检索（不受 filter_meta 限制，搜全库后融合）
-        bm25_results  = pipeline.bm25_store.search(req.question, TOP_K) if pipeline.bm25_store else []
+        vec_rank_map  = {item["chunk_id"]: rank for rank, item in enumerate(vec_results, 1)}
         bm25_rank_map = {item["chunk_id"]: rank for rank, item in enumerate(bm25_results, 1)}
 
-        # ③ RRF 融合
-        if bm25_results:
-            candidates = _module.reciprocal_rank_fusion(vec_results, bm25_results)
-        else:
-            candidates = vec_results
-
-        # ④ 取 Top-K 组装上下文
-        final         = candidates[:TOP_K_FINAL]
-        context, cits = _module.build_context(final)
+        # 与 /query 完全同口径的父块拼装
+        context, cits = _module.build_context(final, pipeline.parents)
 
         # ⑤ LLM 生成
         answer = _module.call_llm(req.question, context, pipeline.client)
@@ -263,7 +333,7 @@ def query_debug(req: QueryRequest):
             ContextChunk(
                 index=i+1,
                 source=_build_source(item),
-                content=item.get("parent_content") or item["content"],
+                content=_module.resolve_chunk_content(item, pipeline.parents),
             ) for i, item in enumerate(final)
         ],
         answer    = answer,

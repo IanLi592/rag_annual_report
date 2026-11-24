@@ -1,0 +1,10 @@
+# 只约束必须用 LF 的可执行脚本；刻意不动 *.py / *.md，
+# 免得把现有工作副本整体 reflow（换行变更会污染 diff）。
+#
+# 为什么必须钉：本机 core.autocrlf=true，重新 clone 时下面这些文件会被转成 CRLF，
+# 而 Git 的 sh.exe 读到 "#!/usr/bin/env sh\r" 会直接 bad interpreter —— 钩子静默失效。
+scripts/git-hooks/* text eol=lf
+*.sh text eol=lf
+
+# JSON 基线也保持 LF，供 Python 读取时行为稳定
+scripts/ci/*.json text eol=lf

@@ -1,0 +1,46 @@
+{
+  "_comment": "CI 断言基线。数值来源见 docs/cicd_requirements.md §8 与 docs/resume_gap_plan.md §11，均为本机实测。2026-11-07 解析去重 + 页脚噪声清理后重建主索引：10352 → 7942 → 7931。2026-11-10 页脚「全文」尾缀 + 落款空格日期两处修复后重解析重建：7931 → 7892（−467 块 = 155 title + 312 text，table 4491 不变）。2026-11-16 解析两处修复（同页表格按 y 并入阅读流、H3 截断改按真实 H2）后重解析重分块重建：7892 → 7874（−18；blocks 39,032 不变、table 块 4,491 不变、raw_table 合计 43,766 行不变；索引按内容精确复用 7,513 条向量、只对 361 条新内容调 embedding）。",
+  "chunks_total": 7874,
+  "embedding_dim": 1024,
+  "pdf_count": 15,
+  "companies": 5,
+  "years": ["2021", "2022", "2023"],
+  "questions_total": 20,
+  "question_types": {
+    "simple_fact": 5,
+    "precise_number": 5,
+    "cross_doc_compare": 4,
+    "time_trend": 3,
+    "should_refuse": 3
+  },
+  "_questions_note": "questions.json 里的字段名是 type；evaluate.py:81 把它映射成 results 里的 question_type。已实测分布如上加总 20。",
+  "required_meta_fields": [
+    "chunk_id",
+    "content",
+    "stock_code",
+    "year",
+    "page_num",
+    "section",
+    "block_types",
+    "is_ocr",
+    "strategy",
+    "source_file",
+    "heading_level",
+    "table_json"
+  ],
+  "artifacts": {
+    "faiss_index": "vectorstore/faiss_index.bin",
+    "faiss_meta": "vectorstore/faiss_meta.json",
+    "reranker_dir": "models/bge-reranker-base"
+  },
+  "interpreter": {
+    "python_minor": "3.12",
+    "default_path": "D:/softwares/miniconda/envs/ailearning/python.exe"
+  },
+  "_budget_s": {
+    "check_static": 20,
+    "check_index": 30,
+    "check_tests": 90,
+    "measured_at": "2026-11-05"
+  }
+}

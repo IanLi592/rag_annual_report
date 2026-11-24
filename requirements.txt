@@ -1,6 +1,6 @@
 # PDF 解析
 pdfplumber>=0.10.0
-pymupdf>=1.23.0          # 即 fitz
+pymupdf>=1.23.0          # 官方名 pymupdf；旧别名 fitz 已废弃（会往 stdout 打警告）
 pytesseract>=0.3.10      # OCR，需配合 tesseract-ocr 安装
 Pillow>=10.0.0
 
@@ -22,7 +22,13 @@ chromadb>=0.4.0
 openai>=1.30.0
 
 # 评估框架
-ragas>=0.2.0
+# 注意：这两个包必须成对钉死，不能放开。
+# ragas 从 0.2.15 一直到 0.4.3，ragas/llms/base.py 顶层都无条件
+# `from langchain_community.chat_models.vertexai import ChatVertexAI`，
+# 而 langchain-community 0.4.2 起删除了该模块 → 升 ragas 没用，只能压 community。
+# 已实测：community 0.4.2 + ragas 0.3.1 → ModuleNotFoundError；0.4.1 下全链路可用。
+ragas==0.3.1
+langchain-community==0.4.1     # 上限锁死：0.4.2 会打断 `import ragas`
 datasets>=2.18.0
 langchain-core>=0.3.0          # RAGAS wrapper 依赖的基类
 langchain-openai>=0.2.0        # ChatOpenAI / OpenAIEmbeddings
@@ -36,3 +42,6 @@ numpy>=1.24.0
 requests>=2.31.0
 tqdm>=4.66.0
 pandas>=2.0.0            # 评估结果展示
+
+# Web UI（app.py 的 Streamlit 简易问答页）
+streamlit>=1.30.0

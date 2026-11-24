@@ -15,6 +15,7 @@ venv/
 # 数据 & 索引（运行产物）
 data
 vectorstore/
+vectorstore_*_backup/
 evaluation/results/
 
 # 本地大模型（避免误提交）
