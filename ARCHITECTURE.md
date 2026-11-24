@@ -119,12 +119,12 @@ chunk_size=500字符，overlap=50字符
 - structured 的摘要前缀带公司名/年份（`【表格摘要】五粮液2021年报 · 章节`），
   同一指标在多份年报里重复出现时更容易被问题命中；BM25 A/B 显示摘要文本会
   稀释关键词分数（Hit@4 0.72→0.68），所以该前缀**只用于 structured 子块**，
-  semantic/BM25 不受影响（见 `docs/resume_gap_plan.md` §15）
+  semantic/BM25 不受影响
 - `heading_level` 优先取解析阶段显式的 H1/H2/H3，缺失时退回 `section_path` 深度
 - 检索时"子块召回、父块拼装"：`rag_pipeline.resolve_chunk_content` 按
   `parent_id` 查 `parents.json`，查不到再退回内联 `parent_content` / 子块自身
 - 落盘到 `vectorstore/structured/`，通过 `RAG_INDEX_DIR` 或 `--index-dir` 切换；
-  **不设为默认**——100 题实测混合检索上弱于 semantic（见 `docs/resume_gap_plan.md` §11）
+  **不设为默认**——100 题实测混合检索上弱于 semantic
 - 章节栈修复后（2026-11-07）曾重分块为 6,838 个 chunks / 4,195 个 parents，
   章节根污染比例从 57% 降到 0.6%
 - 11-16 表格整页抢跑修复重解析后，2026-11-23 重新分块 structured 并落盘、建好索引：
@@ -235,7 +235,7 @@ score(d) = Σ 1 / (k + rank_i(d))    k = 60（经验值）
 - `query()` 生成前还会做**表格行补位**：问题里点名的指标（总资产、营业收入、
   归母净资产等）若在收窄后的表格池里有精确行，就追加一条上下文补进去。
   实测 36 道数字题里，不做补位只有 12 道正常回答，补位后 36 道全部答对
-  （同一批题上调过标签映射，存在过拟合风险，见 `docs/resume_gap_plan.md` §15）
+   （同一批题上调过标签映射，存在过拟合风险）
 - 消费端：CLI `--table-row`、HTTP `POST /table/lookup`
 
 ---
