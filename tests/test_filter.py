@@ -133,11 +133,16 @@ def test_both_retrieval_paths_share_one_predicate(monkeypatch, store):
 
 def test_pipeline_call_sites_pass_filter_meta():
     """
-    AST 静态守卫：RAGPipeline.query 里对 vec_store.search / bm25_store.search 的调用
-    都必须带 filter_meta。
+    AST 静态守卫：RAGPipeline 里对 vec_store.search / bm25_store.search 的调用
+    都必须带 filter_meta，且两路只允许有一个漏斗方法（单公司与多公司共用）。
 
     为什么需要：只看 BM25Store.search 的实现，删掉调用点的第三个实参照样全绿 ——
     而那正是本次缺陷的原样（能力存在但没接上）。
+
+    2026-11-18 结构调整：两路 search 从 `retrieve()` 体内移进 `_search_candidates()`，
+    以便跨公司分支按公司重复调用同一漏斗。守卫跟着钉到「类内所有 search 调用 +
+    唯一漏斗」，比原来只盯 `retrieve` 一个方法更严：任何一处绕过漏斗自己调 search
+    都会被红。
     """
     import ast
     import inspect
@@ -153,11 +158,11 @@ def test_pipeline_call_sites_pass_filter_meta():
 
     cls = next(n for n in ast.walk(tree)
                if isinstance(n, ast.ClassDef) and n.name == "RAGPipeline")
-    retrieve = next(n for n in cls.body
-                    if isinstance(n, ast.FunctionDef) and n.name == "retrieve")
 
+    funnel = next(n for n in cls.body
+                  if isinstance(n, ast.FunctionDef) and n.name == "_search_candidates")
     got: dict[str, int] = {}
-    for node in ast.walk(retrieve):
+    for node in ast.walk(funnel):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -167,10 +172,34 @@ def test_pipeline_call_sites_pass_filter_meta():
         ):
             got[node.func.value.attr] = len(node.args) + len(node.keywords)
 
-    assert "vec_store" in got and "bm25_store" in got, f"没找到两路检索调用，只看到 {got}"
+    assert "vec_store" in got and "bm25_store" in got, f"漏斗里没找到两路检索调用，只看到 {got}"
     # 3 个实参 = query, top_k, filter_meta
     assert got["vec_store"] >= 3, "向量侧调用丢了 filter_meta"
     assert got["bm25_store"] >= 3, "BM25 侧调用丢了 filter_meta —— 就是修前那个缺陷"
+
+    # 漏斗之外的任何方法都不许自己调 search（否则又会长出第二套口径）
+    for fn in cls.body:
+        if not isinstance(fn, ast.FunctionDef) or fn.name == "_search_candidates":
+            continue
+        for node in ast.walk(fn):
+            leak = (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "search"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and is_self(node.func.value.value)
+                    and node.func.value.attr in ("vec_store", "bm25_store"))
+            assert not leak, f"{fn.name}() 绕过 _search_candidates 自己调了检索"
+
+    # 单公司与多公司两条路都必须经过这个漏斗
+    for name in ("retrieve", "_retrieve_multi_company"):
+        method = next(n for n in cls.body
+                      if isinstance(n, ast.FunctionDef) and n.name == name)
+        uses_funnel = any(isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Attribute)
+                          and n.func.attr == "_search_candidates"
+                          and is_self(n.func.value)
+                          for n in ast.walk(method))
+        assert uses_funnel, f"{name}() 没走 _search_candidates 漏斗"
 
     # query() 必须把 filter_meta 原样交给 retrieve()，否则入口处就丢了
     query = next(n for n in cls.body

@@ -48,6 +48,8 @@ INDEX_PATH      = VECTORSTORE_DIR / "faiss_index.bin"
 META_PATH       = VECTORSTORE_DIR / "faiss_meta.json"
 # structured 分块的父块内容单独存放；子块只带 parent_id，避免整份复制
 PARENTS_PATH    = VECTORSTORE_DIR / "parents.json"
+# 表格计量单位的来源（解析产物，不在版本库里；缺失时单位标注自动降级为"未知"）
+PARSED_DIR      = Path(os.getenv("RAG_PARSED_DIR") or (BASE_DIR / "data" / "parsed"))
 
 DASHSCOPE_URL   = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 EMBED_MODEL     = "text-embedding-v3"
@@ -65,7 +67,8 @@ SYSTEM_PROMPT = """你是一个专业的财务分析助手，专门回答关于�
 2. 若参考资料不足以支撑回答，直接说"根据提供的资料无法回答此问题"
 3. 引用具体数据时，在句末标注来源编号，如：营业收入为1476亿元[1]
 4. 数字要精确，不得四舍五入或模糊表达
-5. 回答简洁，重点突出，避免无关废话"""
+5. 回答简洁，重点突出，避免无关废话
+6. 只使用与问题所述公司、年份一致的资料；公司或年份不符的资料不得用来替代作答，宁可说明资料不足"""
 
 
 # ── DashScope 客户端 ──────────────────────────────────────────────────────────
@@ -163,6 +166,45 @@ def infer_filter_from_question(question: str, meta_list: list[dict]) -> dict:
     if len(years) == 1:
         filt["year"] = years[0]
     return filt
+
+
+def infer_companies_from_question(question: str, meta_list: list[dict]) -> list[str]:
+    """问题里点名了哪些公司 → 升序 stock_code 列表（可能 0/1/多个）。
+
+    `infer_filter_from_question` 在同时命中多家公司时**故意**不锁 stock_code
+    （锁哪家都会把另一家滤没），那是单公司检索的正确行为；但跨公司比较题需要
+    「每家都单独召回一次」，所以这里把命中的公司全部列出来给多公司分支用。
+    匹配口径与 infer_filter 一致：完整代码出现在问题里，或 source_file 第三段的
+    公司简称出现在问题里。推断不出来就是空列表，绝不猜。
+    """
+    found = {
+        str(item.get("stock_code", ""))
+        for item in meta_list
+        if item.get("stock_code") and str(item["stock_code"]) in question
+    }
+    for code, name in company_name_map(meta_list).items():
+        if name and name in question:
+            found.add(code)
+    found.discard("")
+    return sorted(found)
+
+
+def missing_companies(codes: list[str], items: list[dict]) -> list[str]:
+    """覆盖校验：被点名的公司里，哪些在上下文中一条证据都没有。
+
+    跨公司表格补位会把多家公司的数值合并进**一条** content，所以除了 stock_code
+    字段还要看正文里是否出现该公司代码 —— 只看字段会把已覆盖的公司误判成缺失。
+    """
+    missing = []
+    for code in codes:
+        covered = any(
+            str(item.get("stock_code", "")) == code
+            or code in str(item.get("content", ""))
+            for item in items
+        )
+        if not covered:
+            missing.append(code)
+    return missing
 
 
 class VectorStore:
@@ -436,6 +478,112 @@ _LABEL_FILLER = re.compile(r"^(?:的|在|和|与|及|为|是)+")
 # 增减/比例/附注列不是指标绝对值；补位只回答"是多少"，这些列会干扰取值。
 _SKIP_COL = re.compile(r"增减|变动|比例|附注|本年比上年")
 
+# 一个单元格"像金额"吗 —— 四条分支各钉一类真实写法：
+#   千分位  `272,699,660,092.25`（元单位摘要表/合并报表）
+#   小数    `3220.55`（万元单位表，常不带分组）
+#   长整数  `8252000000`（无分组无小数的整数金额）
+#   百分数  `91.60%`（毛利率类问题的答案本身）
+# 刻意排除：`2022`（4 位整数 = 年份/序号）、`主要: 水污染物`（纯文字）。
+_AMOUNT_THOUSANDS = re.compile(r"^-?\d+(?:[,，]\d{3})+(?:\.\d+)?$")
+_AMOUNT_DECIMAL   = re.compile(r"^-?\d+\.\d+$")
+_AMOUNT_BARE_INT  = re.compile(r"^-?\d{5,}$")
+_AMOUNT_PERCENT   = re.compile(r"^-?\d+(?:\.\d+)?\s*(?:%|％)$")
+
+
+def looks_like_amount(value) -> bool:
+    """这格是不是金额/比率。补位取错行时的唯一兜底判据。
+
+    实测失效模式（v1 Q11「比较贵州茅台和五粮液2022年的销售毛利率，哪家**公司**更高」）：
+    两家的年报块里都没有"销售毛利率"这一行，旧代码退到 2 字碎片标签"公司"，
+    把第五节环保表里「主要污染物及特征污染物」那行当成指标取了出来。
+    """
+    v = _norm_cell(value)
+    return bool(_AMOUNT_THOUSANDS.match(v) or _AMOUNT_DECIMAL.match(v)
+                or _AMOUNT_BARE_INT.match(v) or _AMOUNT_PERCENT.match(v))
+
+
+# ── 表格计量单位（缺陷 2 修复）────────────────────────────────────────────────
+# 为什么要回到 data/parsed：单位声明行**没有进索引**。实测 002415 2023 全部索引块
+# 里只有 3 处单位声明（页 92/97/117），而取到研发费用行的附注表在第 164-165 页；
+# 300750 2023 合并利润表（第 120 页）的「单位：万元」只存在于解析产物里。
+# 于是同一条补位上下文里会并排出现 11,392,948,404.47（元）与 1,835,610.84（万元），
+# 模型直接比大小必然得出方向相反的结论。
+# data/parsed 不在版本库里（.gitignore 忽略 data/），所以这里是 best-effort：
+# 解析不到就不标注，绝不猜单位。
+_UNIT_DECL_RE = re.compile(r"单位[:：]\s*(百万元|亿元|万元|千元|元)")
+# 行标签/表头自带的单位后缀，如「归属于上市公司股东的净利润（元）」「资产减值（万元）」
+_UNIT_SUFFIX_RE = re.compile(r"[（(]\s*(百万元|亿元|万元|千元|元)\s*[)）]")
+UNIT_UNKNOWN_MARK = "（单位未标注）"
+# 页级声明只在这么宽的页窗内采信。实测 002415 2023 的「万元」声明最后一次出现在
+# 第 136 页，而取到研发费用的附注表在第 164 页 —— 无限carry-over 会把（元）表
+# 标成万元，标错比不标更糟。
+UNIT_PAGE_WINDOW = 2
+
+
+def unit_from_labels(*texts) -> str:
+    """从行标签与表头里抓单位后缀 —— 这个信号就在索引里，不依赖解析产物。
+
+    必须先归一化空白：PDF 断行会把「（万元）」拆成「（万\\n元）」，
+    直接对原文匹配会把明明写着单位的行漏成"单位未标注"。
+    """
+    for t in texts:
+        m = _UNIT_SUFFIX_RE.search(_norm_cell(t))
+        if m:
+            return m.group(1)
+    return ""
+
+
+
+def parse_unit_declarations(blocks: list[dict]) -> list[tuple[int, str]]:
+    """按文档顺序抽出 [(页码, 单位)]，一页内有多个声明时取**最后一个**。
+
+    年报排版是"单位：万元"紧贴在它下面的表格前，同页反复出现（每张子表各写一次），
+    取最后一个才对应最靠近的那张表。
+    """
+    decls: list[tuple[int, str]] = []
+    for block in blocks or []:
+        found = _UNIT_DECL_RE.findall(str(block.get("content") or ""))
+        if not found:
+            continue
+        try:
+            page = int(block.get("page_num"))
+        except (TypeError, ValueError):
+            continue
+        decls.append((page, found[-1]))
+    return decls
+
+
+def unit_at(decls: list[tuple[int, str]], page: int,
+            window: int = UNIT_PAGE_WINDOW) -> str:
+    """第 page 页的单位 = 窗口内（同页或往前 ≤ window 页）最后一条声明；否则未知。"""
+    unit = ""
+    for d_page, d_unit in decls:
+        if d_page > page or page - d_page > window:
+            continue
+        unit = d_unit
+    return unit
+
+
+def load_unit_declarations(source_file: str, parsed_dir: Path) -> list[tuple[int, str]]:
+    """读解析产物拿单位声明序列；文件缺失/损坏一律返回空列表（不抛异常）。"""
+    if not source_file:
+        return []
+    path = Path(parsed_dir) / str(source_file)
+    key = str(path)
+    if key in _UNIT_CACHE:
+        return _UNIT_CACHE[key]
+    decls: list[tuple[int, str]] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            decls = parse_unit_declarations(json.load(f).get("blocks") or [])
+    except (OSError, ValueError):
+        decls = []
+    _UNIT_CACHE[key] = decls
+    return decls
+
+
+_UNIT_CACHE: dict[str, list[tuple[int, str]]] = {}
+
 # 同一指标在不同年份报表里的首列写法不同（2022 年报用"资产总计"而不是
 # "总资产"）。补位只在这里做同义映射，且映射后仍要求首列精确相等。
 _TABLE_LABEL_ALIASES = {
@@ -485,6 +633,59 @@ def _collect_table_rows(items: list[dict], key: str) -> list[dict]:
                     "row":        [("" if c is None else str(c)) for c in row],
                 })
     return rows
+
+
+# ── 表格兜底取数的「行选择」规则 ──────────────────────────────────────────────
+# 为什么需要这一档：`lookup_table_value` 会把同一个指标在年报里出现过的行**全部**
+# 返回（摘要表、合并报表、母公司报表、附注/会计政策各写一遍）。旧实现直接取
+# `found[:1]`，等于按块在语料里的先后顺序碰运气，多年度/多公司题的证据会被整段
+# 丢掉。2026-11-17 离线诊断实测：multihop 34 题里，兜底通道**一条都没有**进到上下文
+# （time_trend 被「无 year 就 return」的闸挡住；跨公司题则被 table_pool 的单公司
+# 硬闸挡住），最终 33/34 题 answer_relevancy 恰好为 0。
+# 现在的规则：同一 (公司, 年度) 内按表来源优先级取一行；不同年度各留一行。
+#
+# 摘要表与合并报表并为第一档，是刻意的：两者数值本应一致，而现状（numeric 36 题
+# 里 32 题的答案数值就是这条通道送进去的）取到的正是「主要会计数据和财务指标」
+# 摘要表；把摘要单独降档会无端改掉一批本来答对的题。
+MAX_BACKFILL_ROWS = 3                  # 一次补位最多合并几个 (公司, 年度) 的行
+_YEARS_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")   # 与 infer_filter_from_question 同形
+
+_CONSOLIDATED_RE = re.compile(r"合并(?:资产负债表|利润表|现金流量表|所有者权益变动表|资产负债表续)")
+_PARENT_RE       = re.compile(r"母公司(?:资产负债表|利润表|现金流量表|所有者权益变动表)")
+_SUMMARY_RE      = re.compile(r"主要会计数据|会计数据和财务指标")
+_NOTES_RE        = re.compile(r"重要会计政策|会计估计|项目附注|财务报表附注|附注")
+
+
+def table_source_rank(item: dict) -> int:
+    """这张表来自哪一档：0 合并/摘要，1 母公司，2 附注与会计政策，3 其他。"""
+    blob = _norm_cell(str(item.get("section") or "") +
+                      str(item.get("content") or "")[:400])
+    if _PARENT_RE.search(blob) and not _CONSOLIDATED_RE.search(blob):
+        return 1
+    if _CONSOLIDATED_RE.search(blob) or _SUMMARY_RE.search(blob):
+        return 0
+    if _NOTES_RE.search(blob):
+        return 2
+    return 3
+
+
+def select_backfill_rows(found: list[dict], pool_by_chunk: dict[str, dict],
+                         max_rows: int = MAX_BACKFILL_ROWS) -> list[dict]:
+    """把同一指标的候选行按 (公司, 年度) 分组，组内取表来源优先级最高的一行。
+
+    同分时保持**池子原顺序**（即年报里的出现顺序），这样单年题选到的行与修复前
+    逐字一致 —— 改动的只是「多年度/多公司时不再只留一行」。
+    """
+    best: dict[tuple[str, str], tuple[int, int, dict]] = {}
+    for pos, r in enumerate(found):
+        key = (str(r.get("stock_code") or ""), str(r.get("year") or ""))
+        rank = (table_source_rank(pool_by_chunk.get(r.get("chunk_id")) or {}), pos)
+        cur = best.get(key)
+        if cur is None or rank < cur[:2]:
+            best[key] = (*rank, r)
+    # 年度升序、公司代码升序：趋势题读起来就是 2021 → 2022 → 2023
+    ordered = sorted(best.values(), key=lambda t: (t[2]["year"], t[2]["stock_code"]))
+    return [t[2] for t in ordered[:max_rows]]
 
 
 def lookup_table_value(
@@ -579,6 +780,9 @@ class RAGPipeline:
     ):
         self.client        = get_client()
         self.index_dir     = Path(index_dir) if index_dir else VECTORSTORE_DIR
+        # 单位声明的查找目录。只在这里赋值：用 object.__new__ 构造的离线守卫实例
+        # 没有这个属性，`_row_unit` 会直接返回"未知"，守卫测试因此不依赖 data/parsed。
+        self.unit_dir      = PARSED_DIR
         self.vec_store     = VectorStore(
             self.client, index_dir=self.index_dir if index_dir else None)
         self.use_bm25      = use_bm25
@@ -609,20 +813,77 @@ class RAGPipeline:
         self,
         filter_meta: Optional[dict] = None,
         question: str = "",
+        stock_codes: Optional[list[str]] = None,
     ) -> list[dict]:
         """表格精确取数的兜底池：收窄到 stock_code/year 后的全部表格块。
 
-        必须有 stock_code 才返回 —— 15 份年报都有“营业收入”，只按年份或全库
+        必须有高置信的公司代码才返回 —— 15 份年报都有“营业收入”，只按年份或全库
         扫会跨公司串数，宁可返回空也不返回错公司的数。
+        `stock_codes`：跨公司比较题显式给出**全部**被点名公司（来自
+        `infer_companies_from_question`），每家都进池，比较题才可能两边都有证据。
+        不传时沿用 filter_meta / 问题推断出的单公司口径，行为与修复前一致。
         """
         filt = dict(filter_meta or {})
         for k, v in infer_filter_from_question(
                 question, self.vec_store.meta_list).items():
             filt.setdefault(k, v)
-        if not filt.get("stock_code"):
+        codes = [str(c) for c in (stock_codes or [])]
+        if not codes and filt.get("stock_code"):
+            codes = [str(filt["stock_code"])]
+        if not codes:
             return []
+        code_set = set(codes)
+        rest = {k: v for k, v in filt.items() if k != "stock_code"}
         return [item for item in self.vec_store.meta_list
-                if item.get("table_json") and match_filter(item, filt)]
+                if item.get("table_json")
+                and str(item.get("stock_code", "")) in code_set
+                and match_filter(item, rest)]
+
+    def _search_candidates(
+        self,
+        retrieval_query: str,
+        filter_meta: Optional[dict],
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """向量 + BM25 召回并 RRF 融合。单公司与多公司两条路共用，口径不分叉。"""
+        vec_results = self.vec_store.search(retrieval_query, TOP_K_RETRIEVE, filter_meta)
+        bm25_results = []
+        if self.use_bm25 and self.bm25_store:
+            bm25_results = self.bm25_store.search(retrieval_query, TOP_K_RETRIEVE, filter_meta)
+            candidates   = reciprocal_rank_fusion(vec_results, bm25_results)
+        else:
+            candidates = vec_results
+        return vec_results, bm25_results, candidates
+
+    def _retrieve_multi_company(
+        self,
+        retrieval_query: str,
+        expanded_question: str,
+        companies: list[str],
+    ) -> dict:
+        """跨公司比较题：每家公司**单独**过滤召回一次，再按公司配额合并。
+
+        不做 per-company 召回时，top-4 会被语料里更相似的那一家占满 —— 实测 v1 的
+        4 道 cross_doc_compare，被点名的两家公司总是只进一家，模型只剩「资料不足」
+        可说。槽位总量不变：仍是 TOP_K_RERANK 条，均分给每家公司。
+        """
+        per = max(1, TOP_K_RERANK // len(companies))
+        all_vec, all_bm25, final = [], [], []
+        for code in companies:
+            vec, bm25, candidates = self._search_candidates(retrieval_query, {"stock_code": code})
+            all_vec  += vec
+            all_bm25 += bm25
+            if self.use_rerank:
+                final += rerank(expanded_question, candidates, per)
+            else:
+                final += candidates[:per]
+
+        return {
+            "query":        retrieval_query,
+            "vec_results":  all_vec,
+            "bm25_results": all_bm25,
+            "candidates":   final,
+            "final":        final,
+        }
 
     def retrieve(
         self,
@@ -643,20 +904,22 @@ class RAGPipeline:
             else expanded_question
         )
 
-        # ② 向量检索
-        vec_results = self.vec_store.search(retrieval_query, TOP_K_RETRIEVE, filter_meta)
+        # ①.5 跨公司比较题走按公司配额的分支（调用方显式给了 filter_meta 时不接管，
+        #      那是人工指定过滤，语义优先）。
+        if filter_meta is None:
+            companies = infer_companies_from_question(question, self.vec_store.meta_list)
+            if len(companies) >= 2:
+                if verbose:
+                    logger.info(f"跨公司检索：{'、'.join(companies)} 每家公司各取配额")
+                return self._retrieve_multi_company(
+                    retrieval_query, expanded_question, companies)
+
+        # ② 向量检索 + ③ BM25 + RRF 融合
+        vec_results, bm25_results, candidates = self._search_candidates(retrieval_query, filter_meta)
         if verbose:
             logger.info(f"向量召回: {len(vec_results)} 条，最高分={vec_results[0]['vec_score']:.3f}" if vec_results else "向量召回: 0 条")
-
-        # ③ BM25 + RRF 融合
-        bm25_results = []
-        if self.use_bm25 and self.bm25_store:
-            bm25_results = self.bm25_store.search(retrieval_query, TOP_K_RETRIEVE, filter_meta)
-            candidates   = reciprocal_rank_fusion(vec_results, bm25_results)
-            if verbose:
+            if self.use_bm25 and self.bm25_store:
                 logger.info(f"BM25 召回: {len(bm25_results)} 条，RRF 后: {len(candidates)} 条")
-        else:
-            candidates = vec_results
 
         # ④ Rerank（与线上同阈值，默认不过滤）
         #    用实体归一后的问题：代码题若只给“000858”，重排同样需要公司名
@@ -676,6 +939,23 @@ class RAGPipeline:
             "final":        final,
         }
 
+    def _row_unit(self, item: dict, row: Optional[list] = None) -> str:
+        """这行数字的计量单位。两层来源，都不成立就返回空串（不猜）：
+          1. 行标签 / 表头自带的「（元）（万元）」后缀 —— 就在索引里，最可靠；
+          2. data/parsed 里窗口内的页级「单位：X」声明。
+        """
+        unit = unit_from_labels(*(row or []), *((item.get("table_json") or [[]])[0]))
+        if unit:
+            return unit
+        parsed_dir = getattr(self, "unit_dir", None)
+        if not parsed_dir:
+            return ""
+        try:
+            page = int(item.get("page_num"))
+        except (TypeError, ValueError):
+            return ""
+        return unit_at(load_unit_declarations(item.get("source_file", ""), parsed_dir), page)
+
     def _table_context_items(
         self,
         question: str,
@@ -688,22 +968,37 @@ class RAGPipeline:
         密集排不进前四 —— 实测 10 道可答题里 5 道因此误拒。表格行直接按首列
         标签取数，不依赖排序，能补上这个召回盲区。
 
-        只在公司/年份能高置信推断时启用；最多补 1 行，避免上下文膨胀。
+        公司必须高置信（`table_pool` 的单公司硬闸不变）；年份**允许多个** ——
+        趋势题按年度各取一行，再合并成**一条**上下文，所以送进 LLM 的上下文条数
+        与修复前完全相同（4 条检索 + 至多 1 条补位），不占额外槽位。
         """
-        pool = self.table_pool(filter_meta, question)
+        pool = self.table_pool(
+            filter_meta, question,
+            stock_codes=infer_companies_from_question(question, self.vec_store.meta_list))
         if not pool:
             return []
-        # 只处理单年点查：跨年趋势题需要多年份上下文，补一行本年数据
-        # 反而会挤占“逐年对比”的证据（实测 RAGAS Context Precision 下滑）。
         filt = dict(filter_meta or {})
         for k, v in infer_filter_from_question(
                 question, self.vec_store.meta_list).items():
             filt.setdefault(k, v)
-        if not filt.get("year"):
+        # 旧闸是 `if not filt.get("year"): return []`。而 infer 层遇到「2021到2023」
+        # 这种多个年份时**故意**不锁年份（tests/test_table_lookup.py 里
+        # test_infer_filter_skips_ambiguous_years 钉着这条），于是这道闸把全部跨年
+        # 趋势题在取数之前就拒了 —— 实测 multihop 34 题没有一条拿到补位上下文。
+        # 原注释的理由（补一行会挤占逐年对比证据、Context Precision 下滑）成立的前提
+        # 正是「只能补一行」；现在按年度各补一行并合并成一条，前提不再成立。
+        # 保留的约束：问题里一个年份都没有时仍然不补（没有年份就无从判断取哪年）。
+        if not filt.get("year") and not _YEARS_RE.findall(_norm_cell(question)):
             return []
         qn = _norm_cell(question)
         names_map = company_name_map(self.vec_store.meta_list)
-        company = names_map.get(pool[0].get("stock_code", ""), "") if pool else ""
+        # 公司名碎片（"宁德"/"时代"）不能当指标名。跨公司题池子里有多家，
+        # 按**全部被点名公司**过滤，而不只看池子第一块那一家。
+        company_names = {names_map[c] for c in
+                         infer_companies_from_question(question, self.vec_store.meta_list)
+                         if names_map.get(c)}
+        if not company_names and pool:
+            company_names = {names_map.get(pool[0].get("stock_code", ""), "")}
         labels: set[str] = set()
         aliases: set[str] = set()
         cell_labels: set[str] = set()
@@ -713,13 +1008,15 @@ class RAGPipeline:
                     continue
                 label = _LABEL_FILLER.sub("", _norm_label(row[0]))
                 cell_labels.add(label)
-                # 公司名碎片（"宁德"/"时代"）也会出现在问题里，不能当指标名
-                if company and (label in company or company in label):
+                if any(cn and (label in cn or cn in label) for cn in company_names):
                     continue
                 # 表格首列常混着 "2021年" "1" 这类序号/年份，它们在问题里
                 # 也出现且往往比指标名更长，必须排除，否则会用年份去取行。
-                if (len(label) >= 2 and not label[0].isdigit()
-                        and len(_CJK_RE.findall(label)) >= 2
+                # 中文指标名至少 3 字：2 字以内必然是碎片 —— 实测"哪家**公司**更高"
+                # 会匹配到环保表的"公司"行，把污染物名称当成财务指标取出来。
+                # 代价（已知）："商誉""存货"这类 2 字指标不再补位，退回正常检索。
+                if (not label[0].isdigit()
+                        and len(_CJK_RE.findall(label)) >= 3
                         and label in qn):
                     labels.add(label)
         # 同义写法（"总资产" vs "资产总计"）与直接命中一起排序：
@@ -737,22 +1034,30 @@ class RAGPipeline:
         if not candidates:
             return []
 
-        rows: list[dict] = []
+        found_all: list[dict] = []
         for label in candidates:
             for name in (label, *_TABLE_LABEL_ALIASES.get(label, ())):
+                # 数值列必须至少有一格像金额，否则这行是文字说明（污染物名称、
+                # 审计意见里的"营业收入"段落），取出来只会污染上下文。
                 found = [r for r in lookup_table_value(pool, name)
                          if _norm_label(r["row"][0]) == _norm_label(name)
-                         and any(_norm_cell(v) for v in r["row"][1:])]
+                         and any(looks_like_amount(v) for v in r["row"][1:])]
                 if found:
-                    rows = found[:1]
+                    found_all = found          # 不在这里截断，交给 select_backfill_rows 分组
                     break
-            if rows:
+            if found_all:
                 break
-        if not rows:
+        if not found_all:
             return []
 
         by_chunk = {item.get("chunk_id"): item for item in pool}
-        out = []
+        # 旧实现是 `rows = found[:1]`：同一指标在一份年报里被摘要表、合并表、母公司表、
+        # 附注各写一遍时，只留块顺序最靠前的那一条，跨年趋势题因此永远只拿到一个年度。
+        rows = select_backfill_rows(found_all, by_chunk)
+
+        out: list[str] = []
+        units: list[str] = []
+        first_row: Optional[dict] = None
         for r in rows:
             src = by_chunk.get(r["chunk_id"], {})
             table = src.get("table_json") or []
@@ -789,15 +1094,33 @@ class RAGPipeline:
                 content += f"{r['stock_code']} {r['year']}年报 · "
             content += (r["section"] or "") + "\n"
             content += f"{r['row'][0]}：{'；'.join(pairs)}"
-            out.append({
-                "chunk_id": r["chunk_id"],
-                "stock_code": r["stock_code"],
-                "year": r["year"],
-                "page_num": r["page_num"],
-                "section": r["section"],
-                "content": content,
-            })
-        return out
+            out.append(content)
+            units.append(self._row_unit(src, r["row"]))
+            if first_row is None:
+                first_row = r
+        if not out:
+            return []
+
+        # 单位标注：只在**至少解析出一个单位**时才动这些行 —— 全未知就保持修复前的
+        # 逐字输出（tests/test_backfill_multiyear 钉着它），不凭空加噪声。
+        # 混合场景（跨公司/跨表补位）里查不到单位的那几行显式标「未标注」，
+        # 让模型看得见"这两行的量纲可能对不上"，而不是拿 11,392,948,404.47 去和
+        # 1,835,610.84 直接比大小（缺陷 2 的实测形状）。
+        if any(units):
+            out = [c + (f"（单位：{u}）" if u else UNIT_UNKNOWN_MARK)
+                   for c, u in zip(out, units)]
+
+        # 多个年度/多家公司的行**合并成一条**上下文：条数与修复前一致（不额外占槽位），
+        # 但每个年度/公司的数值都带着自己的出处写在这一条里。
+        # 引用的 chunk_id/page_num/section 仍取第一条来源，与修复前单行时逐字段一致。
+        return [{
+            "chunk_id": first_row["chunk_id"],
+            "stock_code": first_row["stock_code"],
+            "year": first_row["year"],
+            "page_num": first_row["page_num"],
+            "section": first_row["section"],
+            "content": "\n".join(out),
+        }]
 
     def query(
         self,
@@ -827,6 +1150,20 @@ class RAGPipeline:
         table_items = self._table_context_items(question, filter_meta)
         if table_items:
             final = final + table_items
+
+        # ⑤.6 跨公司覆盖校验：点名的公司只要有一家连一条证据（含补位行）都没进
+        #      上下文，就不让 LLM 在半边证据上作答 —— 实测它会拿手里那一家加上
+        #      常识编出比较结论（v1 Q14 把 2023 年报的 AI 描述当成 2022 年作答）。
+        companies = infer_companies_from_question(question, self.vec_store.meta_list)
+        if len(companies) >= 2:
+            missing = missing_companies(companies, final)
+            if missing:
+                names = company_name_map(self.vec_store.meta_list)
+                who = "、".join(f"{names.get(m, m)}（{m}）" for m in missing)
+                return {
+                    "answer": f"参考资料中缺少 {who} 的年报内容，无法完成跨公司比较。",
+                    "citations": [], "retrieved": final,
+                }
 
         # ⑥ LLM 生成
         context, citations = build_context(final, self.parents)
