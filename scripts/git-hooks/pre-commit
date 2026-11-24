@@ -12,4 +12,4 @@ if ci_skip_requested; then
   exit 0
 fi
 
-exec "$CI_HOME/check_static.sh"
+exec sh "$CI_HOME/check_static.sh"

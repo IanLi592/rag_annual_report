@@ -31,6 +31,21 @@ LABELS = {
 }
 
 
+def _use_utf8_streams() -> None:
+    """把 stdout/stderr 钉成 UTF-8。
+
+    实测踩坑（2026-11-16）：Windows 控制台默认 GBK，而报告里有 `⚠`（回退标记）。
+    于是一旦真的出现回退，`print(render(report))` 就抛 UnicodeEncodeError ——
+    评估早就跑完了，门却永远打不出对比结果，退出码还被 traceback 顶成 1，
+    看起来像「回归门失败」，实际是编码崩的。越该看的那次越看不到。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass          # 被换成非 TextIOWrapper（例如捕获管道）时保持原样
+
+
 def load_doc(path: str | Path) -> dict:
     p = Path(path)
     if not p.exists():
@@ -140,6 +155,7 @@ def render(report: dict) -> str:
 
 
 def main() -> int:
+    _use_utf8_streams()
     ap = argparse.ArgumentParser()
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--latest", required=True)

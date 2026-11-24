@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # 一键跑全套。退出码取"最严重"的那个：断言失败(1) > 前置缺失(2) > 通过(0)。
 # 用法: run_all.sh [--tier p0|p0p1|eval] [--fast-index]
-#   p0    静态 + 索引
+#   p0    静态 + 语料 + 索引
 #   p0p1  再加单测 + 服务门（默认）
 #   eval  只跑 RAGAS 基线对比（花钱档，默认 6 题冒烟）
 set -u
@@ -47,18 +47,26 @@ ci_python
 ci_note "解释器: $CI_PY"
 ci_note "档位: $TIER   仓库: $REPO_ROOT   sha: $(ci_sha)"
 
-run "P0-1 静态门"   "$CI_HOME/check_static.sh"
+# 一律用 `sh <路径>` 调用，不依赖可执行位：本仓库 scripts/ci/*.sh 在 git 索引里
+# 全是 100644（只有 scripts/git-hooks/* 是 100755），本机靠 core.filemode=false +
+# MSYS 给的 +x 才能直接执行；真 Unix 环境 clone 后会 permission denied。
+run "P0-1 静态门"   sh "$CI_HOME/check_static.sh"
 case "$TIER" in
-  p0|p0p1|all) run "P0-2 索引门" "$CI_HOME/check_index.sh" $FAST ;;
-esac
-case "$TIER" in
-  p0p1|all)
-    run "P1-1 单测门" "$CI_HOME/check_tests.sh"
-    run "P1-2 服务门" "$CI_HOME/check_service.sh"
+  p0|p0p1|all)
+    # 语料门排在索引门之前：索引门只证明"索引与 chunks 自洽"，
+    # 语料缺半或装着断流残片时它照样绿。先看文件本身，再看派生产物。
+    run "P0-1.5 语料门" sh "$CI_HOME/check_corpus.sh"
+    run "P0-2 索引门"   sh "$CI_HOME/check_index.sh" $FAST
     ;;
 esac
 case "$TIER" in
-  eval) run "RAGAS 基线对比" "$CI_HOME/check_eval_compare.sh" ;;
+  p0p1|all)
+    run "P1-1 单测门" sh "$CI_HOME/check_tests.sh"
+    run "P1-2 服务门" sh "$CI_HOME/check_service.sh"
+    ;;
+esac
+case "$TIER" in
+  eval) run "RAGAS 基线对比" sh "$CI_HOME/check_eval_compare.sh" ;;
 esac
 T1=$(date +%s)
 

@@ -144,6 +144,7 @@ def run_native_rag(questions: list[dict]) -> list[dict]:
                 "ground_truth": q["ground_truth"],
                 "question_id":  q["id"],
                 "question_type":q["type"],
+                "gen_error":    None,          # 显式标记：生成成功
             })
         except Exception as e:
             logger.error(f"  题目 {q['id']} 失败: {e}")
@@ -154,9 +155,56 @@ def run_native_rag(questions: list[dict]) -> list[dict]:
                 "ground_truth": q["ground_truth"],
                 "question_id":  q["id"],
                 "question_type":q["type"],
+                # 失败必须是个结构化的事实，不能只藏在答案字符串里：
+                # 旧实现只有 'ERROR: …' 这个约定，下游照常拿去打分（见下面的守卫）。
+                "gen_error":    f"{type(e).__name__}: {e}",
             })
 
     return results
+
+
+# ── 生成阶段完整性守卫 ────────────────────────────────────────────────────────
+# 实测踩坑（2026-11-16）：DashScope 账户欠费后每题生成都抛异常，旧实现把
+# 'ERROR: …' 当答案继续往下走 —— RAGAS 照样给这些空答案打分（白烧 1,464 次裁判
+# 调用），产物照常写盘、退出码 0，调用方完全看不出这 96 题是废的；全批失败时
+# ragas 内部还抛 IndexError 崩在最后。
+# 规矩：生成失败的题不进打分（那是花钱的一步），失败率超阈值直接中止。
+# 拒答题「正常检索为空」不算失败 —— 只认 gen_error 这个显式标记。
+
+DEFAULT_MAX_GEN_FAILURE_RATE = 0.1      # 125 题里容忍 12 题偶发；25 题批次容忍 2 题
+
+
+class GenerationIntegrityError(RuntimeError):
+    """生成阶段失败率超过容忍上限。"""
+
+
+def generation_failures(results: list[dict]) -> list[int]:
+    """生成阶段就失败的题号（这些行的分数不可信）。"""
+    return [r["question_id"] for r in results if r.get("gen_error")]
+
+
+def enforce_generation_integrity(
+        results: list[dict],
+        max_failure_rate: float = DEFAULT_MAX_GEN_FAILURE_RATE) -> list[dict]:
+    """返回可以送去打分的行；失败率超阈值时抛 GenerationIntegrityError。
+
+    `max_failure_rate=1.0` 是逃生阀（明知配额有问题还想看部分结果时用），
+    `0.0` 是零容忍（canary 单题探测就该用它）。
+    """
+    if not results:
+        raise GenerationIntegrityError("生成阶段一条结果都没有，没有任何东西可以打分")
+
+    failed = generation_failures(results)
+    rate   = len(failed) / len(results)
+    if rate > max_failure_rate:
+        shown = ", ".join(map(str, failed[:10])) + ("…" if len(failed) > 10 else "")
+        raise GenerationIntegrityError(
+            f"生成失败 {len(failed)}/{len(results)} = {rate:.0%}，超过容忍上限 "
+            f"{max_failure_rate:.0%}（题号 {shown}）。已中止：不进 RAGAS 打分、不落盘。"
+            f"先查 API 配额/账户状态，再重跑。")
+    if failed:
+        logger.warning(f"  生成失败 {len(failed)} 题，已从打分中排除：{failed}")
+    return [r for r in results if not r.get("gen_error")]
 
 
 # ── RAGAS 评估 ────────────────────────────────────────────────────────────────
@@ -307,7 +355,8 @@ def analyze_by_type(results: list[dict]):
 
 # ── 保存结果 ──────────────────────────────────────────────────────────────────
 
-def save_results(raw_results: list[dict], scores: dict, pipeline_name: str):
+def save_results(raw_results: list[dict], scores: dict, pipeline_name: str,
+                 failed_ids: list[int] | None = None):
     import pandas as pd
     from datetime import datetime
 
@@ -318,6 +367,9 @@ def save_results(raw_results: list[dict], scores: dict, pipeline_name: str):
         "pipeline":    pipeline_name,
         "timestamp":   timestamp,
         "scores":      scores,
+        # 哪些题在生成阶段就废了：没有这个字段，一份「96 题是 ERROR 串」的产物
+        # 和一份正常产物长得一模一样，下游只能靠文件大小猜。
+        "generation_failures": list(failed_ids or []),
         "raw_results": raw_results,
     }
     with open(out_path, "w", encoding="utf-8") as f:
@@ -349,7 +401,13 @@ def main():
     parser.add_argument("--question-set", default=None, choices=sorted(QUESTION_SETS),
                         help="题集：v2=125 题四类（默认，可用 RAGAS_QUESTION_SET 覆盖）；"
                              "v1=20 题（ARCHITECTURE.md 旧结论口径）")
+    parser.add_argument("--max-gen-failure-rate", type=float,
+                        default=DEFAULT_MAX_GEN_FAILURE_RATE,
+                        help="生成阶段失败率上限，超过就中止（不打分、不落盘）。"
+                             "默认 %(default)s；0=零容忍（canary 用），1=逃生阀")
     args = parser.parse_args()
+    if not 0.0 <= args.max_gen_failure_rate <= 1.0:
+        parser.error("--max-gen-failure-rate 必须在 0~1 之间")
 
     q_ids = [int(x) for x in args.question_ids.split(",")] if args.question_ids else None
     try:
@@ -373,9 +431,21 @@ def main():
 
     native_results = run_native_rag(questions)
     analyze_by_type(native_results)
+
+    # 守卫必须卡在「花钱打分」之前，而且 --skip-ragas 的 canary 也要过一遍
+    # （canary 的用法就是：跑 1 题 + --skip-ragas + --max-gen-failure-rate 0，
+    #   答案无效就以退出码 2 停在这里，一毛钱裁判调用都不会发生）。
+    try:
+        scorable = enforce_generation_integrity(native_results,
+                                                args.max_gen_failure_rate)
+    except GenerationIntegrityError as e:
+        logger.error(str(e))
+        sys.exit(2)
+    failed_ids = generation_failures(native_results)
+
     if not args.skip_ragas:
-        native_scores = run_ragas_eval(native_results, "native")
-        save_results(native_results, native_scores, "native")
+        native_scores = run_ragas_eval(scorable, "native")
+        save_results(native_results, native_scores, "native", failed_ids)
 
 
 if __name__ == "__main__":

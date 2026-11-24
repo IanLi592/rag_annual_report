@@ -1,5 +1,9 @@
 #!/usr/bin/env sh
-# P0-2 + P1-1 推送前拦截：索引一致性（含 BM25 真实检索）+ 纯函数单测。
+# P0-1.5 + P0-2 + P1-1 推送前拦截：语料完整性（零网络，<1 s）+ 索引一致性（含 BM25
+# 真实检索）+ 纯函数单测。
+# 语料门为什么在这里而不在 pre-commit：它校验的是产物而不是代码，提交时代码改了
+# 语料没动是常态；但推出去之前必须保证别人 clone 完能复现 —— 半截 PDF 或缺两家公司
+# 的 manifest，索引门照样全绿。
 # 服务门 P1-2 不在这里跑（要密钥、要冷启动 12s+），走 run_all.sh。
 #
 # RAGAS 对比门：只有本次推送改到“会影响检索/生成口径”的文件时才跑。
@@ -35,17 +39,24 @@ done
 
 if ci_skip_requested; then
   ci_note "=============================================="
-  ci_note "CI_SKIP=1 —— 本次推送【未经】索引门与单测门，出机后果自负"
+  ci_note "CI_SKIP=1 —— 本次推送【未经】语料门、索引门与单测门，出机后果自负"
   ci_note "=============================================="
   exit 0
 fi
 
+# 门脚本一律用 `sh <路径>` 调用：scripts/ci/*.sh 在 git 索引里是 100644（只有
+# scripts/git-hooks/* 是 100755），直接执行的形式只在 Windows/MSYS 上侥幸可用。
+# 钩子本身必须由 git 直接执行，所以它才需要 chmod —— 见 scripts/git-hooks/README.md。
 worst=$EXIT_PASS
-"$CI_HOME/check_index.sh"; rc=$?
+sh "$CI_HOME/check_corpus.sh"; rc=$?
 [ "$rc" -eq "$EXIT_ASSERT" ] && worst=$EXIT_ASSERT
 [ "$rc" -eq "$EXIT_PREREQ" ] && [ "$worst" -ne "$EXIT_ASSERT" ] && worst=$EXIT_PREREQ
 
-"$CI_HOME/check_tests.sh"; rc=$?
+sh "$CI_HOME/check_index.sh"; rc=$?
+[ "$rc" -eq "$EXIT_ASSERT" ] && worst=$EXIT_ASSERT
+[ "$rc" -eq "$EXIT_PREREQ" ] && [ "$worst" -ne "$EXIT_ASSERT" ] && worst=$EXIT_PREREQ
+
+sh "$CI_HOME/check_tests.sh"; rc=$?
 [ "$rc" -eq "$EXIT_ASSERT" ] && worst=$EXIT_ASSERT
 [ "$rc" -eq "$EXIT_PREREQ" ] && [ "$worst" -ne "$EXIT_ASSERT" ] && worst=$EXIT_PREREQ
 
@@ -54,7 +65,7 @@ if [ "$RELEVANT" -eq 1 ]; then
     ci_note "改到了检索/分块/题集，但 CI_EVAL=0 —— 跳过 RAGAS 对比"
   else
     ci_note "改到了检索/分块/题集，跑 RAGAS 冒烟对比（默认 6 题）"
-    "$CI_HOME/check_eval_compare.sh"
+    sh "$CI_HOME/check_eval_compare.sh"
     rc=$?
     # 默认报告不拦人；CI_EVAL_STRICT=1 时把回退当失败
     if [ "${CI_EVAL_STRICT:-0}" = "1" ] && [ "$rc" -eq "$EXIT_ASSERT" ]; then

@@ -21,9 +21,13 @@ git ls-files -s scripts/git-hooks
 
 | 钩子 | 阶段 | 内容 | 实测耗时 |
 |---|---|---|---|
-| `pre-commit` | 提交前 | P0-1 静态门：8 文件 `py_compile` + 单进程 import 冒烟 | 见 `docs/cicd_requirements.md` §8 |
-| `pre-push` | 推送前 | P0-2 索引门（含 BM25 建库 + 真实检索）+ P1-1 单测门 | ≈ 11 s + ≈ 2 s |
+| `pre-commit` | 提交前 | P0-1 静态门：27 个 `.py` 做 `py_compile` + 单进程 import 冒烟 8/8 | 见 `docs/cicd_requirements.md` §8 |
+| `pre-push` | 推送前 | P0-1.5 语料门（零网络，`manifest` 与 `data/raw_pdf` 对账）+ P0-2 索引门（含 BM25 建库 + 真实检索）+ P1-1 单测门 | ≈ 1 s + ≈ 11 s + ≈ 2 s |
 | `pre-push`（条件） | 推送前 | 改动 `parse_pdf.py` / `chunk_documents.py` / `rag_pipeline.py` / 题集时，跑 RAGAS 6 题冒烟对比 | ≈ 2~4 min，报告不拦人 |
+
+语料门放 pre-push 而不放 pre-commit：它校验的是**产物**而不是代码，提交时代码改了语料没动是
+常态；但推出去之前必须保证别人 clone 完能复现 —— 半截 PDF 或缺两家公司的 manifest，索引门
+照样全绿（详见 `docs/cicd_requirements.md` §17）。
 
 RAGAS 对比门的基线是 `scripts/ci/ragas_baseline.json`。第一次跑（或主动
 `--update-baseline`）会建立基线；没有 `DASHSCOPE_API_KEY` / 裁判 key 时跳过，
