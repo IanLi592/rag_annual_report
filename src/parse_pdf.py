@@ -80,11 +80,18 @@ CHAPTER_PATTERNS = [
     re.compile(r"^\d+\.\s"),                                # 1. 2.
 ]
 
+# 页眉/页脚：公司名 [+ 年份] + 年度报告。尾缀只放开“全文”一种 —— 修复前产物里
+# 这类行实测 890 条、全部是「全文」尾缀（不带尾缀的另有 1,452 行，旧正则本来就滤）；
+# 语料中另有“…年度报告正文/原件/摘要/。”这类真实句子，放宽尾缀集合等于删正文。
+# 同一条正则同时用于正文过滤（NOISE_PATTERNS）与章节栈过滤
+# （is_non_section_title），避免两处再次出现“一边漏、一边也漏”的漂移。
+_REPORT_FOOTER_RE = re.compile(r"^.{1,40}年度报告(?:\s*全文)?\s*$")
+
 NOISE_PATTERNS = [
-    re.compile(r"^.{1,40}年度报告\s*$"),    # 页眉：公司名+年度报告
-    re.compile(r"^\d+\s*$"),                # 独立页码
-    re.compile(r"^—\s*\d+\s*—$"),          # — 38 —
-    re.compile(r"^\d+\s*/\s*\d+$"),         # 62 / 143（页脚页码，避免混进 section_path）
+    _REPORT_FOOTER_RE,                # 页眉/页脚：公司名+年度报告（含“全文”尾缀）
+    re.compile(r"^\d+\s*$"),          # 独立页码
+    re.compile(r"^—\s*\d+\s*—$"),    # — 38 —
+    re.compile(r"^\d+\s*/\s*\d+$"),   # 62 / 143（页脚页码，避免混进 section_path）
 ]
 
 
@@ -135,26 +142,34 @@ def classify_heading(title: str, fontsize: Optional[float] = None, is_bold: bool
 # 这些“标题”会被字体/加粗规则误判，且一旦进入 section_path 就会长期留在栈顶：
 #   · 目录页的“目录” / “第一节 ……… 3”（点线）
 #   · 封面公司名、落款日期
-# 实测未过滤时，主索引 63.5% 的 chunk 章节根是“目录/公司名/日期”，
-# structured 的 parents.json 有 57% 同样被污染。
+# 实测未过滤时（2026-11-07 旧产物），主索引 63.5% 的 chunk 章节根是“目录/公司名/日期”，
+# structured 的 parents.json 有 57% 同样被污染。修复 + 11-10/11-16 三轮过滤后，
+# 2026-11-23 在当前盘上产物重测：主索引与 structured 的章节根污染率均为 0%（见 §3.3 策略 D），
+# 63.5%/57% 仅作为修复前对照保留。
 _TOC_TITLE_RE    = re.compile(r"^目\s*录$")
 _TOC_LEADER_RE   = re.compile(r"\.{6,}")
+# 落款日期。数字与“年月日”之间允许空格：五粮液/海康的 PDF 里实测是
+# `2022 年4 月29 日` `2021 年12 月31 日` 这种带空格写法（修复前产物实测 33 块
+# 因此进过栈，涉及 4 个不同日期串）。
+# 整行锚定不能放宽 —— 语料里 `于2021年12月31日`、`截至2021年12月31日止12个月`
+# 这类正文片段共 10 块，锚一丢就会整句被误杀。
 _DATE_TITLE_RE   = re.compile(
-    r"^[\d〇○零一二三四五六七八九十]{2,4}年"
-    r"[\d〇○零一二三四五六七八九十]{1,2}月"
-    r"[\d〇○零一二三四五六七八九十]{1,2}日$")
+    r"^[\d〇○零一二三四五六七八九十]{2,4}\s*年"
+    r"\s*[\d〇○零一二三四五六七八九十]{1,2}\s*月"
+    r"\s*[\d〇○零一二三四五六七八九十]{1,2}\s*日$")
 _COMPANY_TITLE_RE = re.compile(r"^.{2,30}(?:股份有限公司|有限责任公司|有限公司)$")
 _CHAPTER_RE      = re.compile(r"^第[一二三四五六七八九十百]+章")
 _SECTION_RE      = re.compile(r"^第[一二三四五六七八九十百]+节")
 
 
 def is_non_section_title(title: str) -> bool:
-    """标题出现在版面上，但不应该进入章节路径（目录/封面色/落款）。"""
+    """标题出现在版面上，但不应该进入章节路径（目录/封面/落款/页脚）。"""
     t = title.strip()
     return bool(
         _TOC_TITLE_RE.fullmatch(t)
         or _DATE_TITLE_RE.fullmatch(t)
         or _COMPANY_TITLE_RE.fullmatch(t)
+        or _REPORT_FOOTER_RE.match(t)
         or _TOC_LEADER_RE.search(t)
     )
 
@@ -278,8 +293,18 @@ class AnnualReportParser:
             self._section_stack = self._section_stack[:1] + [title]     # H2
             self._section_levels = self._section_levels[:1] + [2]
         elif level == 3:
-            self._section_stack = self._section_stack[:2] + [title]     # H3
-            self._section_levels = self._section_levels[:2] + [3]
+            # H3 的截断点 = 「栈里最后一个真实 H2 之后」，而不是硬切 [:2]。
+            # 硬切隐含假设栈永远是 [H1, H2, H3] 三层，但这份语料普遍是「第X节」
+            # 直接当 H1、「一、xxx」就是最低层（修复前全库仅 3 个 chunk 带 H2 层）。
+            # 于是每来一个新 H3，上一个同级标题会被当成父级永久留在栈中间：
+            #   第二节 公司简介 > 一、公司信息 > 四、注册变更情况   ← 中间层是过期同级
+            # 修复前 parsed 实测 2,957 块的路径里同时挂着两个不同的「一、」样式。
+            cut = 1                                          # 没有真实 H2 就只留 H1
+            for i, lv in enumerate(self._section_levels):
+                if lv == 2:
+                    cut = i + 1                              # 切在最后一个真实 H2 之后
+            self._section_stack = self._section_stack[:cut] + [title]      # H3
+            self._section_levels = self._section_levels[:cut] + [3]
         else:
             # 没有编号规律的标题保留旧行为：最多保留三级 + 当前标题
             self._section_stack = self._section_stack[:3] + [title]
@@ -374,21 +399,47 @@ class AnnualReportParser:
             return
 
         # ── 2. 提取表格（用 pdfplumber）──
-        table_bboxes = []
-        for table in plumb_page.extract_tables():
-            if table:
-                md = table_to_markdown(table)
-                if md:
-                    self.blocks.append(ParsedBlock(
-                        block_type="table",
-                        content=md,
-                        page_num=page_num + 1,
-                        section_path=list(self._section_stack),
-                        raw_table=table,
-                    ))
-        # 记录表格所在区域（后续跳过这些区域的文字提取）
+        # 表格只「排队」，不立刻入库。旧版在这里直接 append，于是同一页内所有表格
+        # 永远比所有标题先入库，盖的是「进入本页之前」的章节栈。五粮液 2021 第 5 页
+        # 实测（pdfplumber/PyMuPDF 原始坐标）：
+        #   y= 97.67 标题 第二节 公司简介和主要财务指标
+        #   y=142.83 标题 一、公司信息
+        #   y=162.04 表格 股票简称 | 五粮液 | 股票代码 | 000858
+        #   y=450.32 标题 二、联系人和联系方式
+        #   y=469.65 表格 董事会秘书 | 证券事务代表   …… 四张表四张标题交替排列
+        # 旧逻辑把这四张表全标成上一页结束时的「第一节 重要提示和释义 > 释 义」。
+        # 修复前 parsed 全库 4,491 个表格块里 3,059 个（68.1%）同页存在排在其后的
+        # 标题，即暴露于该缺陷。改法：一页内只有一条阅读流，谁在上面谁先入库，
+        # 表格入库时才用「此刻」的章节栈盖章（见 _flush_tables_above）。
+        # 注：table_obj.extract() 与 page.extract_tables() 等价 —— pdfplumber 0.11.10
+        # 里后者就是 [t.extract(**text_settings) for t in find_tables()]，抽样 5 页
+        # 逐字比对相等；这里合成一次遍历，顺便保证行数据与 bbox 天然对齐。
+        table_bboxes   = []
+        pending_tables = []            # [[top_y, markdown, rows]]，被下方文字追平时入库
         for table_obj in plumb_page.find_tables():
-            table_bboxes.append(table_obj.bbox)
+            table_bboxes.append(table_obj.bbox)      # 后续跳过这些区域的文字提取
+            rows = table_obj.extract()
+            md   = table_to_markdown(rows)
+            if md:
+                pending_tables.append([table_obj.bbox[1], md, rows])
+        pending_tables.sort(key=lambda item: item[0])
+
+        def _flush_tables_above(y: float) -> None:
+            """把起点在 y 之上的表格按 y 顺序入库，用当前章节栈盖章。"""
+            if not pending_tables:
+                return
+            ready    = [t for t in pending_tables if t[0] < y]
+            if not ready:
+                return
+            pending_tables[:] = [t for t in pending_tables if t[0] >= y]
+            for _top_y, md, rows in ready:
+                self.blocks.append(ParsedBlock(
+                    block_type="table",
+                    content=md,
+                    page_num=page_num + 1,
+                    section_path=list(self._section_stack),
+                    raw_table=rows,
+                ))
 
         # ── 3. 提取文字（跳过表格区域，逐行处理）──
         # 注意：table_bboxes 必须真的用上。旧版收集了它却从未在下面的循环里判断，
@@ -424,6 +475,12 @@ class AnnualReportParser:
 
                 if _in_table(line.get("bbox")):
                     continue   # 表格内容只保留 table 块那一份
+
+                # 阅读顺序：这条线已经在某些表格下方，那些表格先入库（在此刻的章节
+                # 栈下盖章，所以位于表格之上的标题已经生效、位于其下的还没有）。
+                # 必须在 _update_section 之前调用，否则表格会被它下方的标题污染。
+                # bbox 缺失时按页面顶部处理（y=0 → 谁都不冲刷，退化成旧行为）。
+                _flush_tables_above((line.get("bbox") or [0, 0, 0, 0])[1])
 
                 # 判断是否标题
                 spans    = line.get("spans", [])
@@ -467,6 +524,13 @@ class AnnualReportParser:
                 page_num=page_num + 1,
                 section_path=list(self._section_stack),
             ))
+
+        # 页尾收尾：还压在队列里的表格都排在本页最后一条可见文字之下，用本页最终
+        # 章节栈盖章。少了这一步，纯表格页（表格一直排到页底）会整张丢掉表格。
+        # 已知残留：段落块要等段落结束才入库，所以「起点落在段落中间」的表格仍会
+        # 排在该段落块之前 —— 与修复前方向一致（修复前是全部表格都在全部文字之前），
+        # 彻底纠正要把段落按表格边界切开，涉及块正文本身，不在本次修复范围。
+        _flush_tables_above(float("inf"))
 
     def parse(self) -> list[ParsedBlock]:
         logger.info(f"开始解析: {self.pdf_path.name}")
