@@ -121,7 +121,8 @@ reranker_path     models/bge-reranker-base   # 1.1 GB，缺失时检索降级（
 
 | 脚本 | 入参 | 退出码 | 耗时 |
 |---|---|---|---|
-| `scripts/ci/check_static.sh` | 无 | 0/1/2 | **已实测 4 s**：`py_compile` 8 文件（0.25 s 级）+ 单进程 import 冒烟 **2.3 s**（分进程跑要 9.41 s，已合并） |
+| `scripts/ci/check_static.sh` | 无 | 0/1/2 | **已实测 4 s**：`py_compile` 覆盖 src/evaluation/scripts-ci 下 27 个 `.py`（原文档记的"8 文件"是 import 冒烟的模块数，见 §17）+ 单进程 import 冒烟 **2.3 s**（分进程跑要 9.41 s，已合并） |
+| `scripts/ci/check_corpus.sh` | 无 | 0/1/2 | **已实测 0–1 s**：调 `src/download_reports.py --verify`，零网络零密钥；2 = 还没下载过语料（新克隆正常） |
 | `scripts/ci/check_index.sh` | `--allow-drift` / `--fast` | 0/1/2 | **已实测完整 11–14 s**（BM25 建库 9.5–12.0 s，波动来自 jieba 缓存冷热）；`--fast` **0.13 s** |
 | `scripts/ci/check_tests.sh` | 无 | 0/1/2 | **已实测 4–5 s**（35 条用例本身 1.1–1.4 s，余为解释器启动） |
 | `scripts/ci/check_service.sh` | `--port 8011` / `--timeout` | 0/1/2 | 无 key 时**已实测走 SKIP（退出码 2）**；冷启动总时长仍 `待实测`（需 key） |
@@ -586,3 +587,97 @@ MiMo 打 4 个指标 **49 s**。按此粗估全量 17 题 ≈ **14–18 分钟**
 
 全套 **80 passed**；`run_all --tier p0` 全绿 34 s。产物 `evaluation/results/native_20261106_093451.json`
 与日志 `full_mimo_run.log`。仍未 commit。
+
+
+## 17. 下载环节缺陷修复 + 语料门进 CI（2026-11-10）
+
+起因是全链路走读第 1 段。当时按「数字必须开磁盘产物实测」的口径核对
+`src/download_reports.py`，发现它虽然只 190 行，却有 6 处会**静默**污染下游的问题。
+这一节只记增量；§9 那张「M1/M2 落地状态」表和 §8/§10 的实测记录是当时的快照，不重写。
+
+### 改了什么（`src/download_reports.py`）
+
+| # | 旧行为 | 新行为 |
+|---|---|---|
+| 1 | `_do_query` 把异常收敛成空列表 + `logger.debug`，断网与「确实没有这份年报」在日志里同形，脚本照样 0 退出 | 返回类型改为 `list 或 None`，异常走 warning；`main` 分开记「查询失败 / 未命中 / 下载失败」，有问题退出码 1（`:156`） |
+| 2 | `candidates[0]` 直接取第一条，选中原始稿还是更正稿取决于巨潮未文档化的返回顺序 | 纯函数 `select_report()`（`:99`）：更正/修订稿优先 → `announcementTime` 最新（类型不可比则跳过这层）→ 首条；摘要/英文/取消/补充/问询/回复一律排除 |
+| 3 | docstring 写「按 secCode 过滤」，代码做的是拆字 + 标题筛；形参 `stock_code` 在函数体内**从未被引用** | `_restrict_to_stock()`（`:78`）真按 secCode 复核归属，且只在字段存在时生效（拿不存在的字段过滤会清空结果）；docstring 与实现对齐 |
+| 4 | 流式写正式路径，三次重试全败后半成品留盘；下次 `save_path.exists()` 判「已存在，跳过」→ **截断 PDF 进 manifest** | 原子下载：写 `.part` → `fsync` → `is_valid_pdf` 通过才 `os.replace`（`:219`）。刻意不删任何文件 |
+| 5 | `manifest = []` 每次从头攒，某几家当次查询失败则清单凭空少几条，而 `parse_pdf.py:557` 按 manifest 驱动全流程 → 语料无声缩水 | 起点是上一版清单，本次成功的覆盖对应键，落盘前只保留磁盘上存在且结构完整的条目（`:278`/`:291`）；字段集合抽成 `MANIFEST_FIELDS` 常量 |
+| 6 | 下载环节零测试、零校验 | `--verify` 零网络产物校验（`:369` 起），已做成 CI 语料门 |
+
+### 语料门：`check_corpus.sh`（P0-1.5）
+
+排在索引门**之前**。理由：索引门断言的是派生物自洽 —— 语料缺两家公司、或装着
+一次断流留下的半截 PDF 时，它的 13 条断言照样全绿。上游脏、下游对得上，不等于
+下游是对的。成本实测 0–1 s、零网络、零密钥，没有不进的理由。
+
+- `run_all.sh --tier p0` 现为 静态 → 语料 → 索引（`--fast-index` 下全绿 6 s）
+- `pre-push` 也已挂上（同日追加）：放在最前，沿用同样的三档累积。放 pre-push
+  不放 pre-commit 的理由已写进钩子注释 —— 它校验产物而非代码，提交时语料没动是
+  常态，但推出去之前必须保证别人 clone 完能复现。实演（空 stdin，不触发 RAGAS 档）：
+  语料门 0 s PASS → 索引门 13 条全绿 10 s → 单测门 270 passed 6 s，钩子退出码 0。
+- `record.py --tier corpus` 三档都记账，PASS/SKIP/FAIL 见 `evaluation/results/ci-latest.json`
+
+### 退出码为什么在 Python 侧复制一份 `EXIT_*`
+
+新克隆还没下载过语料时，`--verify` 必须返回 **2（前置缺失）** 而不是 1（回归）——
+否则第一次跑 CI 就把「正常的第一步没做」报成代码坏了。同时 `--verify` 也会被人在
+CI 外面手敲，语义必须和门里一致，所以三档常量在 Python 侧也留一份。重复就有漂移
+风险，于是把「不许漂移」做成断言：`test_exit_code_constants_agree_with_ci_lib_sh`
+直接读 `ci_lib.sh` 比对同名同值。
+
+### 守卫与证据
+
+- 全量 **236 → 270 passed**。新增 `tests/test_download_reports.py` 34 条（下载逻辑守卫 30 +
+  退出码 4），全部离线零网络。
+- 反向验证：7 个「把代码改回旧行为」的突变，**7/7 都让测试变红**，还原后 sha256 逐字节
+  一致、无残留标记。过程踩到两处自己的错：其一，台架脚本一行解包写错，崩在突变之前；
+  其二更要紧 —— **第一轮只报「4/4 被抓」，实际有 3 个突变的定位串命中 0 次被静默跳过**。
+  本机 `core.autocrlf=true`，工作副本 CRLF 而定位串写了 `\n`。「未命中」被算成「已验证」，
+  假绿比漏测更危险，已改成按文件实际行尾匹配、且命中数不等于 1 直接判失败。
+- 退出码那 4 条没走文件突变台架（台架脚本已按指示移入回收站），改用进程内赋值做敏感性
+  检查：`corpus_prereq_missing` 恒空则退出码从 2 掉到 1；`EXIT_PREREQ=1` 则与 `ci_lib.sh`
+  脱钩。两者均可复现。
+- 真实文件上的红路径：`RAW_DIR` 保持指向真 `data/raw_pdf`，只把 `MANIFEST_PATH` 换成临时
+  目录里一份做脏的副本（抽掉 600519/2021、另一条指向空气）→ 报 5 项、退出码 1，文件缺失 /
+  缺少年报条目 / 清单外孤儿 / 清单与文件名不匹配 四类探测器同时开火。**真语料一个字节没被
+  写**：`data/manifest.json` mtime 仍为 2026-11-02 18:53，15 份 PDF、85 MB 未变，无 `.part` 残留。
+
+### 顺带纠正的两处文档不实（`docs/cicd_usage.md`）
+
+- 「186 条纯函数守卫」→ 实测 **270**。这个数字在我动手前就已过期，`ci-latest.json` 里
+  上一轮记的是 198。
+- 静态门「8 个文件 py_compile」→ 实测覆盖 **27 个 `.py`**；那个 8 是 import 冒烟的模块数，
+  被写串了行。
+
+### 一处写入事故（如实记）
+
+本节第一次落盘时用 heredoc 传 Python 列表，写出 3,900 多行垃圾（含 68 行只有 `*` 的行），
+并把 `docs/cicd_requirements.md` 撑到 4,532 行、还让 git 因为裸 CR 把它判成二进制
+（`git diff --numstat` 输出 "Files differ"）。原文 589 行与 §4.1 那一行的改动都没损坏，
+是按字节定位把尾部垃圾截掉后重写的。改用「Markdown 片段 + 不含 CJK 的极短拼接脚本」完成。
+
+### 还没做 / 做不到
+
+1. **没联网跑真实下载**。②③④ 的线上效果要一次真下载才算端到端；尤其 `secCode` 这个字段
+   当前接口是否真的返回，我没有当时的日志，**无法离线确认**。守卫已锁死「字段缺失时不许
+   清空结果」，所以最坏情况是归属复核不生效，不会导致全量下载失败。
+2. §9/§8/§10 的历史实测表没动，只新增本节增量（按你的口径）。
+3. 一处**既有**脆弱点，同日已按「调用侧一律 `sh`」的口径修掉：`scripts/ci/*.sh` 在 git 索引里
+   全是 `100644`，只有 `scripts/git-hooks/*` 是 `100755`（`scripts/git-hooks/README.md` 原本只教
+   了给钩子补 chmod）。而 `run_all.sh`、`pre-commit`、`pre-push` 原先是**直接执行**这些门的，
+   本机靠 `core.filemode=false` + MSYS 给的 `+x` 才侥幸能跑；真 Unix 环境 clone 后大概率
+   permission denied。现已把 11 处调用点全部改成 `sh "$CI_HOME/xxx.sh"`，门脚本自身是否可执行
+   不再影响结论；钩子仍由 git 直接执行，所以 `100755` 照旧必须。
+   **这条改动的价值只能靠「直接执行点已清零」来论证**：本机 `chmod -x` 是空操作（权限位改完
+   仍是 `-rwxr-xr-x`），Unix 上那个失败模式在这台机器上复现不了。回归验证：`run_all --tier p0`
+   三门全绿 6 s、`pre-push` 实演退出码 0、`pre-commit` 实演退出码 0。
+
+### 状态
+
+改动文件：`src/download_reports.py`、`scripts/ci/check_corpus.sh`（新）、`scripts/ci/run_all.sh`、
+`scripts/git-hooks/pre-commit`、`scripts/git-hooks/pre-push`、`tests/test_download_reports.py`（新）、
+`docs/cicd_usage.md`、`scripts/git-hooks/README.md`、`docs/cicd_requirements.md`（本节）。
+全套 270 passed、静态门 0、`--tier p0` 全绿、pre-push 与 pre-commit 实演退出码均为 0。
+**均未 commit。**

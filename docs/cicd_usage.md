@@ -12,22 +12,23 @@
 sh scripts/ci/run_all.sh --tier p0p1
 ```
 
-实测 35–80 s（波动来自机器负载）。想快就 `--tier p0`（静态+索引），再配 `--fast-index` 把索引门从约 26 s 压到 0.1 s。
+实测 35–80 s（波动来自机器负载）。想快就 `--tier p0`（静态+语料+索引），再配 `--fast-index` 把索引门从约 26 s 压到 0.1 s。
 
-**平时不用手动跑**：`git commit` 自动跑静态门，`git push` 自动跑索引门 + 单测门。服务门和评估因为要冷启动/花钱，故意不进钩子。
+**平时不用手动跑**：`git commit` 自动跑静态门，`git push` 自动跑索引门 + 单测门。服务门和评估因为要冷启动/花钱，故意不进钩子。语料门只挂在 `run_all.sh` 上（不到 1 s、零网络），没进钩子是因为它拦的是**产物**而不是代码，提交时代码改了语料没动是常态。
 
 ---
 
-## 四道门分别是什么
+## 五道门分别是什么
 
 | 门 | 命令 | 查什么 | 需要 key |
 |---|---|---|---|
-| 静态 | `sh scripts/ci/check_static.sh` | 8 个文件 `py_compile` + 单进程 import 冒烟 | 否 |
+| 静态 | `sh scripts/ci/check_static.sh` | 27 个 `.py` 做 `py_compile` + 单进程 import 冒烟 8/8 | 否 |
+| 语料 | `sh scripts/ci/check_corpus.sh` | `data/raw_pdf` + `manifest.json` 对账：15 条齐全、每份 PDF 头尾结构完整、清单外孤儿 PDF、残留 `.part`。**排在索引门之前**——索引门只证明派生物自洽，语料缺半它照样绿 | 否 |
 | 索引 | `sh scripts/ci/check_index.sh` | 13 条断言：7931×1024 自洽、必需字段存在、评测集题数与题型分布、真实 BM25 检索命中、**过滤语义在真实语料上生效** | 否 |
-| 单测 | `sh scripts/ci/check_tests.sh` | 186 条纯函数守卫（分块/引用格式化/RRF/指标计算/落盘/裁判配置/探针分类/Qwen-VL 响应解析/拒答分类/索引选择/页眉页脚噪声） | 否 |
+| 单测 | `sh scripts/ci/check_tests.sh` | 270 条纯函数守卫（分块/引用格式化/RRF/指标计算/落盘/裁判配置/探针分类/Qwen-VL 响应解析/拒答分类/索引选择/页眉页脚噪声/**年报下载与语料校验**） | 否 |
 | 服务 | `sh scripts/ci/check_service.sh --port 8011` | 拉起 uvicorn → 轮询 `/health` 到 200 → 关停并确认端口释放 | 是 |
 
-索引门的 `--allow-drift` 用于"你确实改了语料重建了索引"之后复核；长期基线改 `scripts/ci/baseline.json`。
+语料门就是 `python src/download_reports.py --verify` 的一层外壳，可以单独手敲。索引门的 `--allow-drift` 用于"你确实改了语料重建了索引"之后复核；长期基线改 `scripts/ci/baseline.json`。
 
 ---
 
@@ -57,7 +58,7 @@ RAGAS_LLM_PROVIDER=deepseek sh scripts/ci/run_eval.sh --question-ids 1
 |---|---|---|
 | 0 | 通过 | —— |
 | 1 | **断言失败，是真回归** | 看 `[CI][FAIL]` 行的"期望 vs 实际"，命令会直接指向改动的地方 |
-| 2 | **前置缺失**（没 key / 没索引 / 没 pytest） | 不是代码问题。索引门会给重建命令，服务门会让你填 `.env` |
+| 2 | **前置缺失**（没 key / 没语料 / 没索引 / 没 pytest） | 不是代码问题。语料门会让你先跑 `python src/download_reports.py`，索引门会给重建命令，服务门会让你填 `.env` |
 
 ## 逃生阀
 

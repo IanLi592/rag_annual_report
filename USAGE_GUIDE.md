@@ -187,7 +187,7 @@ python src/chunk_documents.py --strategy structured # 表格摘要 + 章节树 P
 
 **预期输出**：
 ```
-data/chunks/all_semantic.json   # 7,931 个 chunks，文件 11.42 MiB（实测 11,973,715 字节）
+data/chunks/all_semantic.json   # 7,874 个 chunks，文件 18.23 MiB（实测 19,118,039 字节，2026-11-16 重解析后重分块）
 ```
 
 每个 chunk 的格式：
@@ -226,18 +226,18 @@ python src/build_index.py --strategy structured --out-dir vectorstore/structured
 会额外写 `parents.json`（父块全文），检索时按子块的 `parent_id` 查表拼装。
 
 **内部流程**：
-1. 加载 `data/chunks/all_semantic.json`（7,931 条）
+1. 加载 `data/chunks/all_semantic.json`（7,874 条）
 2. 按批次（10 条/批，共 ~794 批）调用 DashScope text-embedding-v3
 3. 对所有向量做 L2 归一化（使内积等价于余弦相似度）
 4. 构建 FAISS IndexFlatIP，批量 add 归一化向量
 5. 分别保存索引文件和元数据
 
-**耗时与费用**：约 5~10 分钟；7,931 条 × 平均 50 token ≈ 40 万 token ≈ **约 0.35 元**
+**耗时与费用**：约 5~10 分钟；7,874 条 × 平均 50 token ≈ 40 万 token ≈ **约 0.35 元**
 
 **预期输出**：
 ```
-vectorstore/faiss_index.bin   # 30.98 MiB（7931 × 1024 × 4 bytes）
-vectorstore/faiss_meta.json   # 11.61 MiB（每条 chunk 的文本 + 溯源元数据）
+vectorstore/faiss_index.bin   # 30.76 MiB（7874 × 1024 × 4 = 32,251,904 + 45 字节头，实测文件 32,251,949 字节）
+vectorstore/faiss_meta.json   # 17.53 MiB（实测 18,382,058 字节；每条 chunk 的文本 + 溯源元数据）
 ```
 
 **进度日志**（每 100 批打印一次）：
@@ -245,7 +245,7 @@ vectorstore/faiss_meta.json   # 11.61 MiB（每条 chunk 的文本 + 溯源元�
 2026-11-07 [INFO] Embedding 进度: 100/794 批
 2026-11-07 [INFO] Embedding 进度: 200/794 批
 ...
-2026-11-07 [INFO] 索引构建完成，共 7931 条向量
+2026-11-16 [INFO] 索引构建完成，共 7874 条向量
 2026-11-07 [INFO] FAISS 索引已保存 → vectorstore/faiss_index.bin  (31724 KB)
 ```
 
@@ -411,7 +411,7 @@ uvicorn serve:app --host 0.0.0.0 --port 8000
 启动日志：
 ```
 服务启动，初始化 RAG Pipeline...
-FAISS 索引加载完成，共 7931 条向量
+FAISS 索引加载完成，共 7874 条向量
 构建 BM25 索引（分词中，请稍候）...
 BM25 索引完成
 Pipeline 初始化完成，开始接受请求
@@ -568,7 +568,7 @@ console.log(data.answer);
 ### 5.1 RAGAS 自动评估
 
 ```bash
-# 评估原生版（约需 30 分钟，每题多次 LLM 调用）
+# 评估原生版（v2 全量实测约 27 分钟：生成约 10 分钟 + RAGAS 打分约 16 分钟，每题多次 LLM 调用）
 python evaluation/evaluate.py
 
 # 只跑几道题（调试用）
@@ -605,7 +605,7 @@ sh scripts/ci/check_eval_compare.sh --update-baseline --per-category 2
 # 指标回退超过 3pp 时退出码 1（默认只报告，不拦人）
 sh scripts/ci/check_eval_compare.sh --strict
 
-# 全量 125 题（30~60 分钟，花钱档）
+# 全量 125 题（实测约 26.5 分钟，花钱档；2026-11-23 全量跑通、无限流）
 python evaluation/evaluate.py --question-set v2
 ```
 
@@ -703,5 +703,5 @@ LLM_MODEL = "deepseek-chat"
 | 05 单次问答（CLI）| 2~5 sec | ~0.002 元/次 | — |
 | serve.py 启动 | ~10 sec（一次性）| 免费 | 约 1.5 GB 内存（常驻）|
 | HTTP 单次请求 | 2~5 sec | ~0.002 元/次 | — |
-| RAGAS 评估（v1 20 题）| 30~60 min | ~5~10 元 | — |
-| RAGAS 评估（v2 125 题）| 按题数约为 v1 的 6 倍（未完整跑过，仅线性估算）| 同左比例 | — |
+| RAGAS 评估（v1 20 题）| ≈5~7 min（历史两轮实测 292 s / 393 s）| ~5~10 元 | — |
+| RAGAS 评估（v2 125 题）| ≈26.5 min（2026-11-23 全量实测，无限流）| 生成+裁判按次计费（见 results 运行记录）| — |

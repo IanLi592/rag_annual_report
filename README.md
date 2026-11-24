@@ -11,9 +11,9 @@
 | 环节 | 产物 | 实测 |
 |------|------|------|
 | 语料 | `data/raw_pdf/` | 15 份 PDF（5 家公司 × 2021–2023），84.3 MiB |
-| 解析 | `data/parsed/` | 15 个 JSON，共 39,499 个 blocks（表格去重 + 页脚噪声清理后） |
-| 分块 | `data/chunks/all_semantic.json` | 7,931 个 chunks，平均 526 字符，11.42 MiB（2026-11-07 解析去重后） |
-| 索引 | `vectorstore/faiss_index.bin` | 7,931 × 1024 维，30.98 MiB（`faiss_meta.json` 11.61 MiB） |
+| 解析 | `data/parsed/` | 15 个 JSON，共 39,032 个 blocks（表格去重 + 页脚/落款噪声过滤后，2026-11-10 重解析） |
+| 分块 | `data/chunks/all_semantic.json` | 7,874 个 chunks，平均 528 字符，18.23 MiB（2026-11-16 重解析后重分块） |
+| 索引 | `vectorstore/faiss_index.bin` | 7,874 × 1024 维，30.76 MiB（`faiss_meta.json` 17.53 MiB） |
 | 评测 | `evaluation/questions.json` / `questions_v2.json` | v1 20 题（旧口径）；v2 125 题：numeric 36 / multihop 34 / hallucination 30 / refusal 25 |
 
 ## 快速开始
@@ -110,4 +110,4 @@ rag_annual_report/
 
 1. `data/`、`vectorstore/`、`models/` 都被 `.gitignore` 排除。新克隆需自己跑步骤 1–4，建索引约 5–10 分钟、约 0.35 元。
 2. Rerank 默认开启，但**分数下限默认关闭**（`RERANK_MIN_SCORE` 未设置时不丢上下文），本地没有 1.1 GB 的 `models/bge-reranker-base/` 时会自动降级为直接截断，不影响其他环节。OCR 依赖系统级 `tesseract-ocr`，未安装则扫描页留占位符。Qwen-VL 分支默认 `VLM_MODE=off`，只在 `--vlm-mode complex` 或 `--vlm-pages` 时调用，且有 `VLM_MAX_PAGES` 硬预算与按页缓存。
-3. ~~表格内容在 `table` 与 `text` 块重复~~ **已修（2026-11-07）**：`parse_pdf.py` 原先收集了 `table_bboxes` 却从未在文字提取里使用，摘要页 77% 的文字行被重复发射；现在表格区域只保留 table 块那一份，块数 43,048 → 39,893；同日再过滤 `62 / 143` 这类页脚页码，最终 39,499。
+3. ~~表格内容在 `table` 与 `text` 块重复~~ **已修（2026-11-07）**：`parse_pdf.py` 原先收集了 `table_bboxes` 却从未在文字提取里使用，摘要页 77% 的文字行被重复发射；现在表格区域只保留 table 块那一份，块数 43,048 → 39,893；同日再过滤 `62 / 143` 这类页脚页码，最终 39,499。**2026-11-10 又补了两处漏**：页脚尾缀「…2021 年度报告全文」与带空格的落款「2022 年4 月29 日」原先同时绕过正文噪声过滤（`NOISE_PATTERNS`）和章节栈过滤（`is_non_section_title`），重解析后块数 39,499 → 39,032，chunk 里脏 `section` 320 → 0、正文含页脚行的 chunk 383 → 0。**11-16 重解析后复核**：`（续）`跑马灯已进噪声过滤（全库实测 72 块全部整行只有「（续）」二字，加过滤零误伤）；`2021年` 年度表头单元格**仍不处理**——92,932 处命中全部在表格单元格内部，过滤等于动所有财报表的数值，风险远大于收益。
