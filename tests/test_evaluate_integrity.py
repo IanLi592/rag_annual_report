@@ -34,7 +34,11 @@ def bad_row(qid, msg="Error code: 400 - Arrearage"):
 
 
 class FakePipeline:
-    """只替 RAGPipeline 的 query：题目文本含 BOOM 就抛，复刻 API 报错的形状。"""
+    """只替 RAGPipeline 的 query：题目文本含 BOOM 就抛，复刻 API 报错的形状。
+    真实 RAGPipeline 构造时总会设 self.parents（rag_pipeline.py:802），run_native_rag
+    取上下文要用，故此处按契约补上空父块表。"""
+
+    parents = {}
 
     def __init__(self, *a, **k):
         pass

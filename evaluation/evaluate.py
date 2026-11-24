@@ -121,6 +121,22 @@ def load_questions(question_ids: list[int] = None, which: str | None = None) -> 
 
 # ── 原生版 RAG 调用 ──────────────────────────────────────────────────────────
 
+def ragas_contexts(retrieved: list[dict], parents: dict) -> list[str]:
+    """把每条检索结果拼成「来源标签 + 正文」，与 build_context 喂给作答模型的口径一致。
+
+    旧实现直接取裸正文（[r["content"] ...]），丢掉了 chunk 的 stock_code / 年份 /
+    章节这些只存在于来源标签里的信息 —— 于是当参考答案（ground_truth）要求模型
+    指出「这个数属于哪家公司」时，RAGAS 裁判看到的上下文里根本没有那家公司的标识，
+    忠实度(Faithfulness)与上下文召回率(Context Recall)被系统性低估。这里复用同一条
+    build_context 链路（label 取自其 citations 的 source，正文取自 resolve_chunk_content），
+    使「模型看到的」与「裁判看到的」严格一致。逐条独立，不改动检索到的块集合。
+    """
+    from rag_pipeline import build_context, resolve_chunk_content
+    _, cits = build_context(retrieved, parents)
+    return [f"{c['source']}\n{resolve_chunk_content(item, parents)}"
+            for item, c in zip(retrieved, cits)]
+
+
 def run_native_rag(questions: list[dict]) -> list[dict]:
     """
     调用 src/rag_pipeline.py 中的 RAGPipeline 跑所有测试题。
@@ -140,7 +156,7 @@ def run_native_rag(questions: list[dict]) -> list[dict]:
             results.append({
                 "question":     q["question"],
                 "answer":       result["answer"],
-                "contexts":     [r["content"] for r in result["retrieved"]],
+                "contexts":     ragas_contexts(result["retrieved"], pipeline.parents),
                 "ground_truth": q["ground_truth"],
                 "question_id":  q["id"],
                 "question_type":q["type"],
